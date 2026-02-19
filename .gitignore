@@ -1,0 +1,76 @@
+# Build directories
+/build/
+/bin/
+/lib/
+/CMakeFiles/
+/CMakeCache.txt
+/*.cmake
+/*.make
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Object files and compiled code
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.a
+
+# CUDA specific
+*.ptx
+*.cubin
+*.fatbin
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+*.swo
+*.bak
+
+# Visual Studio / VS Code
+.vscode/
+*.vcxproj*
+*.sln
+*.user
+*.suo
+*.ipch
+*.ncb
+*.opensdf
+*.sdf
+
+# JetBrains IDEs
+.idea/
+*.iml
+
+# MacOS
+.DS_Store
+
+# Linux
+*~
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+*.whl
+*.eggs/
+.eggs/
+
+# pip / setuptools
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Cursor rules
+.cursorrules
