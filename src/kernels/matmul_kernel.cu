@@ -62,8 +62,9 @@ void launch_matmul_kernel(const T* A, const T* B, T* C, int M, int N, int K, cud
 
 template <typename T>
 void launch_matmul_tiled_kernel(const T* A, const T* B, T* C, int M, int N, int K, int tile_size, cudaStream_t stream) {
-    dim3 threads(tile_size, tile_size);
-    dim3 blocks(ceil_div(N, tile_size), ceil_div(M, tile_size));
+    (void)tile_size;
+    dim3 threads(TILE_DIM, TILE_DIM);
+    dim3 blocks(ceil_div(N, TILE_DIM), ceil_div(M, TILE_DIM));
     matmul_tiled_kernel<<<blocks, threads, 0, stream>>>(A, B, C, M, N, K);
     CUDEEP_CHECK_LAST_KERNEL();
 }

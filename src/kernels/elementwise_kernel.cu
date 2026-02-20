@@ -102,6 +102,28 @@ void launch_fill_kernel(T* data, T value, int64_t n, cudaStream_t stream) {
     CUDEEP_CHECK_LAST_KERNEL();
 }
 
+// ---- Broadcast: matrix [N,M] + row [M] ----
+
+template <typename T>
+__global__ void broadcast_add_row_kernel(const T* matrix, const T* row, T* output,
+                                          int64_t rows, int64_t cols) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = rows * cols;
+    if (idx >= total) return;
+    int64_t col = idx % cols;
+    output[idx] = matrix[idx] + row[col];
+}
+
+template <typename T>
+void launch_broadcast_add_row_kernel(const T* matrix, const T* row, T* output,
+                                      int64_t rows, int64_t cols, cudaStream_t stream) {
+    int64_t total = rows * cols;
+    int threads = DEFAULT_BLOCK_SIZE;
+    int blocks = ceil_div(static_cast<int>(total), threads);
+    broadcast_add_row_kernel<<<blocks, threads, 0, stream>>>(matrix, row, output, rows, cols);
+    CUDEEP_CHECK_LAST_KERNEL();
+}
+
 // Explicit instantiations
 template void launch_add_kernel<float>(const float*, const float*, float*, int64_t, cudaStream_t);
 template void launch_add_kernel<double>(const double*, const double*, double*, int64_t, cudaStream_t);
@@ -115,6 +137,8 @@ template void launch_scalar_mul_kernel<float>(const float*, float, float*, int64
 template void launch_scalar_mul_kernel<double>(const double*, float, double*, int64_t, cudaStream_t);
 template void launch_fill_kernel<float>(float*, float, int64_t, cudaStream_t);
 template void launch_fill_kernel<double>(double*, double, int64_t, cudaStream_t);
+template void launch_broadcast_add_row_kernel<float>(const float*, const float*, float*, int64_t, int64_t, cudaStream_t);
+template void launch_broadcast_add_row_kernel<double>(const double*, const double*, double*, int64_t, int64_t, cudaStream_t);
 
 }  // namespace kernels
 }  // namespace cudeep

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from cuDeep._core import Tensor, MemoryPool
+from cuDeep._core import Tensor, MemoryPool, device_info as _device_info
 
 
 def memory_stats():
@@ -20,6 +20,5 @@ def release_memory():
 
 
 def device_info():
-    """Query basic CUDA device properties."""
-    # TODO: expose cudaGetDeviceProperties via binding
-    return {"status": "not yet implemented"}
+    """Query CUDA device properties."""
+    return _device_info()

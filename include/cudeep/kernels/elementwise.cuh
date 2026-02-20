@@ -23,5 +23,10 @@ void launch_scalar_mul_kernel(const T* a, float scalar, T* out, int64_t n, cudaS
 template <typename T>
 void launch_fill_kernel(T* data, T value, int64_t n, cudaStream_t stream = nullptr);
 
+template <typename T>
+void launch_broadcast_add_row_kernel(
+    const T* matrix, const T* row, T* output,
+    int64_t rows, int64_t cols, cudaStream_t stream = nullptr);
+
 }  // namespace kernels
 }  // namespace cudeep

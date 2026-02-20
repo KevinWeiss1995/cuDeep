@@ -28,3 +28,15 @@ def ones(shape, dtype=DType.float32):
 
 def randn(shape, dtype=DType.float32):
     return _Tensor.randn(list(shape), dtype)
+
+
+def zeros_like(tensor):
+    return _Tensor.zeros(tensor.shape(), tensor.dtype())
+
+
+def ones_like(tensor):
+    return _Tensor.ones(tensor.shape(), tensor.dtype())
+
+
+def randn_like(tensor):
+    return _Tensor.randn(tensor.shape(), tensor.dtype())

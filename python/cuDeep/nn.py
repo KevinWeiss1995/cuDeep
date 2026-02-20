@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from typing import Optional
 
-from cuDeep._core import Tensor, DType
+from cuDeep._core import (
+    Tensor, DType,
+    relu, sigmoid, gelu, silu, tanh_act, leaky_relu,
+    conv2d_forward, broadcast_add,
+)
 
 
 class Module:
@@ -55,9 +59,9 @@ class Linear(Module):
             self.register_parameter("bias", Tensor.zeros([out_features], dtype))
 
     def forward(self, x):
-        out = x.matmul(self._parameters["weight"])
+        out = x.matmul(self._parameters["weight"].transpose(0, 1).contiguous())
         if "bias" in self._parameters:
-            out = out + self._parameters["bias"]
+            out = broadcast_add(out, self._parameters["bias"])
         return out
 
 
@@ -88,24 +92,44 @@ class Conv2d(Module):
             self.register_parameter("bias", Tensor.zeros([out_channels], dtype))
 
     def forward(self, x):
-        # TODO: call conv2d forward kernel via native binding
-        raise NotImplementedError("Conv2d forward not yet wired to CUDA kernel")
+        bias = self._parameters.get("bias", None)
+        return conv2d_forward(
+            x, self._parameters["weight"], bias,
+            list(self.stride), list(self.padding))
 
 
 class ReLU(Module):
     def forward(self, x):
-        # TODO: dispatch to activation kernel
-        raise NotImplementedError
+        return relu(x)
 
 
 class Sigmoid(Module):
     def forward(self, x):
-        raise NotImplementedError
+        return sigmoid(x)
+
+
+class Tanh(Module):
+    def forward(self, x):
+        return tanh_act(x)
 
 
 class GELU(Module):
     def forward(self, x):
-        raise NotImplementedError
+        return gelu(x)
+
+
+class SiLU(Module):
+    def forward(self, x):
+        return silu(x)
+
+
+class LeakyReLU(Module):
+    def __init__(self, negative_slope=0.01):
+        super().__init__()
+        self.negative_slope = negative_slope
+
+    def forward(self, x):
+        return leaky_relu(x, self.negative_slope)
 
 
 class Sequential(Module):

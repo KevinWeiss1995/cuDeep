@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.24)
+cmake_minimum_required(VERSION 3.22)
 project(cuDeep LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -27,6 +27,9 @@ set(CUDEEP_SOURCES
     src/kernels/conv_kernel.cu
     src/kernels/loss_kernel.cu
     src/kernels/reduce_kernel.cu
+    src/kernels/optim_kernel.cu
+    src/kernels/pool_kernel.cu
+    src/kernels/norm_kernel.cu
 )
 
 add_library(cudeep SHARED ${CUDEEP_SOURCES})
@@ -39,6 +42,7 @@ target_include_directories(cudeep PUBLIC
 target_link_libraries(cudeep PUBLIC
     CUDA::cudart
     CUDA::cublas
+    CUDA::curand
 )
 
 set_target_properties(cudeep PROPERTIES
