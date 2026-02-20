@@ -30,6 +30,7 @@ set(CUDEEP_SOURCES
     src/kernels/optim_kernel.cu
     src/kernels/pool_kernel.cu
     src/kernels/norm_kernel.cu
+    src/kernels/unary_kernel.cu
 )
 
 add_library(cudeep SHARED ${CUDEEP_SOURCES})

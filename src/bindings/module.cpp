@@ -14,6 +14,8 @@
 #include "cudeep/kernels/norm.cuh"
 #include "cudeep/kernels/optim.cuh"
 #include "cudeep/kernels/elementwise.cuh"
+#include "cudeep/kernels/unary.cuh"
+#include "cudeep/kernels/matmul.cuh"
 
 namespace py = pybind11;
 
@@ -711,4 +713,269 @@ PYBIND11_MODULE(_cudeep_core, m) {
         }
         return out;
     }, py::arg("input"), py::arg("scalar"));
+
+    // ---- Unary ops (for autograd) ----
+
+#define BIND_UNARY_OP(name, launch_fn)                                        \
+    m.def(#name, [](const Tensor& t) {                                        \
+        Tensor input = ensure_contiguous(t);                                   \
+        Tensor out(input.shape(), input.dtype());                              \
+        int64_t n = input.numel();                                             \
+        switch (input.dtype()) {                                               \
+            case DType::Float32:                                               \
+                kernels::launch_fn<float>(                                     \
+                    static_cast<const float*>(input.data()),                    \
+                    static_cast<float*>(out.data()), n, input.stream());        \
+                break;                                                         \
+            case DType::Float64:                                               \
+                kernels::launch_fn<double>(                                    \
+                    static_cast<const double*>(input.data()),                   \
+                    static_cast<double*>(out.data()), n, input.stream());       \
+                break;                                                         \
+            default:                                                           \
+                throw std::runtime_error(#name ": unsupported dtype");          \
+        }                                                                      \
+        return out;                                                            \
+    }, py::arg("input"));
+
+    BIND_UNARY_OP(neg, launch_neg_kernel)
+    BIND_UNARY_OP(exp_op, launch_exp_kernel)
+    BIND_UNARY_OP(log_op, launch_log_kernel)
+    BIND_UNARY_OP(sqrt_op, launch_sqrt_kernel)
+    BIND_UNARY_OP(abs_op, launch_abs_kernel)
+#undef BIND_UNARY_OP
+
+    m.def("pow_op", [](const Tensor& t, float exponent) {
+        Tensor input = ensure_contiguous(t);
+        Tensor out(input.shape(), input.dtype());
+        int64_t n = input.numel();
+        switch (input.dtype()) {
+            case DType::Float32:
+                kernels::launch_pow_kernel<float>(
+                    static_cast<const float*>(input.data()), exponent,
+                    static_cast<float*>(out.data()), n, input.stream());
+                break;
+            case DType::Float64:
+                kernels::launch_pow_kernel<double>(
+                    static_cast<const double*>(input.data()), exponent,
+                    static_cast<double*>(out.data()), n, input.stream());
+                break;
+            default:
+                throw std::runtime_error("pow_op: unsupported dtype");
+        }
+        return out;
+    }, py::arg("input"), py::arg("exponent"));
+
+    m.def("clamp_op", [](const Tensor& t, float lo, float hi) {
+        Tensor input = ensure_contiguous(t);
+        Tensor out(input.shape(), input.dtype());
+        int64_t n = input.numel();
+        switch (input.dtype()) {
+            case DType::Float32:
+                kernels::launch_clamp_kernel<float>(
+                    static_cast<const float*>(input.data()),
+                    static_cast<float*>(out.data()), lo, hi, n, input.stream());
+                break;
+            case DType::Float64:
+                kernels::launch_clamp_kernel<double>(
+                    static_cast<const double*>(input.data()),
+                    static_cast<double*>(out.data()), lo, hi, n, input.stream());
+                break;
+            default:
+                throw std::runtime_error("clamp_op: unsupported dtype");
+        }
+        return out;
+    }, py::arg("input"), py::arg("lo"), py::arg("hi"));
+
+    m.def("gt_mask", [](const Tensor& t, float threshold) {
+        Tensor input = ensure_contiguous(t);
+        Tensor out(input.shape(), input.dtype());
+        int64_t n = input.numel();
+        switch (input.dtype()) {
+            case DType::Float32:
+                kernels::launch_gt_mask_kernel<float>(
+                    static_cast<const float*>(input.data()), threshold,
+                    static_cast<float*>(out.data()), n, input.stream());
+                break;
+            case DType::Float64:
+                kernels::launch_gt_mask_kernel<double>(
+                    static_cast<const double*>(input.data()), threshold,
+                    static_cast<double*>(out.data()), n, input.stream());
+                break;
+            default:
+                throw std::runtime_error("gt_mask: unsupported dtype");
+        }
+        return out;
+    }, py::arg("input"), py::arg("threshold") = 0.0f);
+
+    // Elementwise div (already have kernel, just need binding)
+    m.def("div_op", [](const Tensor& a, const Tensor& b) {
+        Tensor ia = ensure_contiguous(a);
+        Tensor ib = ensure_contiguous(b);
+        Tensor out(ia.shape(), ia.dtype());
+        int64_t n = ia.numel();
+        switch (ia.dtype()) {
+            case DType::Float32:
+                kernels::launch_div_kernel<float>(
+                    static_cast<const float*>(ia.data()),
+                    static_cast<const float*>(ib.data()),
+                    static_cast<float*>(out.data()), n, ia.stream());
+                break;
+            case DType::Float64:
+                kernels::launch_div_kernel<double>(
+                    static_cast<const double*>(ia.data()),
+                    static_cast<const double*>(ib.data()),
+                    static_cast<double*>(out.data()), n, ia.stream());
+                break;
+            default:
+                throw std::runtime_error("div_op: unsupported dtype");
+        }
+        return out;
+    }, py::arg("a"), py::arg("b"));
+
+    // ---- Activation backward (for autograd) ----
+    m.def("activation_backward", [](const Tensor& grad_output, const Tensor& input,
+                                     const std::string& act_name, float alpha) {
+        Tensor go = ensure_contiguous(grad_output);
+        Tensor inp = ensure_contiguous(input);
+        Tensor grad_input(inp.shape(), inp.dtype());
+        int64_t n = inp.numel();
+
+        kernels::ActivationType act;
+        if (act_name == "relu") act = kernels::ActivationType::ReLU;
+        else if (act_name == "sigmoid") act = kernels::ActivationType::Sigmoid;
+        else if (act_name == "tanh") act = kernels::ActivationType::Tanh;
+        else if (act_name == "gelu") act = kernels::ActivationType::GELU;
+        else if (act_name == "silu") act = kernels::ActivationType::SiLU;
+        else if (act_name == "leaky_relu") act = kernels::ActivationType::LeakyReLU;
+        else throw std::runtime_error("Unknown activation: " + act_name);
+
+        switch (inp.dtype()) {
+            case DType::Float32:
+                kernels::launch_activation_backward_kernel<float>(
+                    static_cast<const float*>(go.data()),
+                    static_cast<const float*>(inp.data()),
+                    static_cast<float*>(grad_input.data()),
+                    n, act, alpha, inp.stream());
+                break;
+            case DType::Float64:
+                kernels::launch_activation_backward_kernel<double>(
+                    static_cast<const double*>(go.data()),
+                    static_cast<const double*>(inp.data()),
+                    static_cast<double*>(grad_input.data()),
+                    n, act, alpha, inp.stream());
+                break;
+            default:
+                throw std::runtime_error("activation_backward: unsupported dtype");
+        }
+        return grad_input;
+    }, py::arg("grad_output"), py::arg("input"), py::arg("act_name"), py::arg("alpha") = 0.01f);
+
+    // ---- Row-sum reduction: [N,M] -> [M] (sum along axis 0) ----
+    m.def("sum_reduce_rows", [](const Tensor& t) {
+        Tensor input = ensure_contiguous(t);
+        auto& shape = input.shape();
+        int64_t rows = shape[0], cols = shape[1];
+        Tensor out({cols}, input.dtype());
+        switch (input.dtype()) {
+            case DType::Float32:
+                kernels::launch_sum_reduce_rows_kernel<float>(
+                    static_cast<const float*>(input.data()),
+                    static_cast<float*>(out.data()), rows, cols, input.stream());
+                break;
+            case DType::Float64:
+                kernels::launch_sum_reduce_rows_kernel<double>(
+                    static_cast<const double*>(input.data()),
+                    static_cast<double*>(out.data()), rows, cols, input.stream());
+                break;
+            default:
+                throw std::runtime_error("sum_reduce_rows: unsupported dtype");
+        }
+        return out;
+    }, py::arg("input"));
+
+    // ---- Conv2d backward (for autograd) ----
+    m.def("conv2d_backward_data", [](
+        const Tensor& grad_output, const Tensor& weight,
+        std::vector<int64_t> input_shape,
+        std::vector<int> stride, std::vector<int> padding
+    ) {
+        Tensor go = ensure_contiguous(grad_output);
+        Tensor w = ensure_contiguous(weight);
+        auto& wshape = w.shape();
+        int B  = static_cast<int>(input_shape[0]);
+        int IC = static_cast<int>(input_shape[1]);
+        int IH = static_cast<int>(input_shape[2]);
+        int IW = static_cast<int>(input_shape[3]);
+        int OC = static_cast<int>(wshape[0]);
+        int KH = static_cast<int>(wshape[2]);
+        int KW = static_cast<int>(wshape[3]);
+        int SH = stride[0], SW = stride[1];
+        int PH = padding[0], PW = padding[1];
+
+        Tensor grad_input(input_shape, go.dtype());
+        grad_input.zero_();
+        switch (go.dtype()) {
+            case DType::Float32:
+                kernels::launch_conv2d_backward_data_kernel<float>(
+                    static_cast<const float*>(go.data()),
+                    static_cast<const float*>(w.data()),
+                    static_cast<float*>(grad_input.data()),
+                    B, IC, OC, IH, IW, KH, KW, SH, SW, PH, PW, go.stream());
+                break;
+            case DType::Float64:
+                kernels::launch_conv2d_backward_data_kernel<double>(
+                    static_cast<const double*>(go.data()),
+                    static_cast<const double*>(w.data()),
+                    static_cast<double*>(grad_input.data()),
+                    B, IC, OC, IH, IW, KH, KW, SH, SW, PH, PW, go.stream());
+                break;
+            default:
+                throw std::runtime_error("conv2d_backward_data: unsupported dtype");
+        }
+        return grad_input;
+    }, py::arg("grad_output"), py::arg("weight"),
+       py::arg("input_shape"), py::arg("stride"), py::arg("padding"));
+
+    m.def("conv2d_backward_weight", [](
+        const Tensor& grad_output, const Tensor& input,
+        std::vector<int64_t> weight_shape,
+        std::vector<int> stride, std::vector<int> padding
+    ) {
+        Tensor go = ensure_contiguous(grad_output);
+        Tensor inp = ensure_contiguous(input);
+        auto& ishape = inp.shape();
+        int B  = static_cast<int>(ishape[0]);
+        int IC = static_cast<int>(ishape[1]);
+        int IH = static_cast<int>(ishape[2]);
+        int IW = static_cast<int>(ishape[3]);
+        int OC = static_cast<int>(weight_shape[0]);
+        int KH = static_cast<int>(weight_shape[2]);
+        int KW = static_cast<int>(weight_shape[3]);
+        int SH = stride[0], SW = stride[1];
+        int PH = padding[0], PW = padding[1];
+
+        Tensor grad_weight(weight_shape, go.dtype());
+        grad_weight.zero_();
+        switch (go.dtype()) {
+            case DType::Float32:
+                kernels::launch_conv2d_backward_weight_kernel<float>(
+                    static_cast<const float*>(go.data()),
+                    static_cast<const float*>(inp.data()),
+                    static_cast<float*>(grad_weight.data()),
+                    B, IC, OC, IH, IW, KH, KW, SH, SW, PH, PW, go.stream());
+                break;
+            case DType::Float64:
+                kernels::launch_conv2d_backward_weight_kernel<double>(
+                    static_cast<const double*>(go.data()),
+                    static_cast<const double*>(inp.data()),
+                    static_cast<double*>(grad_weight.data()),
+                    B, IC, OC, IH, IW, KH, KW, SH, SW, PH, PW, go.stream());
+                break;
+            default:
+                throw std::runtime_error("conv2d_backward_weight: unsupported dtype");
+        }
+        return grad_weight;
+    }, py::arg("grad_output"), py::arg("input"),
+       py::arg("weight_shape"), py::arg("stride"), py::arg("padding"));
 }

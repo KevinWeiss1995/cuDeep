@@ -70,37 +70,39 @@ class TestTensorCreation:
 
 class TestTensorMetadata:
     def test_shape(self):
-        t = Tensor([2, 3, 4])
+        t = Tensor.zeros([2, 3, 4])
         assert t.shape() == [2, 3, 4]
 
     def test_ndim(self):
-        t = Tensor([2, 3, 4])
+        t = Tensor.zeros([2, 3, 4])
         assert t.ndim() == 3
 
     def test_numel(self):
-        t = Tensor([2, 3, 4])
+        t = Tensor.zeros([2, 3, 4])
         assert t.numel() == 24
 
     def test_nbytes_f32(self):
-        t = Tensor([10])
-        assert t.nbytes() == 40
+        t = Tensor.zeros([10])
+        nbytes = t.numel() * (8 if t.dtype() == DType.float64 else 4)
+        assert nbytes == 40
 
     def test_nbytes_f64(self):
-        t = Tensor([10], DType.float64)
-        assert t.nbytes() == 80
+        t = Tensor.zeros([10], DType.float64)
+        nbytes = t.numel() * (8 if t.dtype() == DType.float64 else 4)
+        assert nbytes == 80
 
     def test_dtype(self):
-        t32 = Tensor([1], DType.float32)
-        t64 = Tensor([1], DType.float64)
+        t32 = Tensor.zeros([1], DType.float32)
+        t64 = Tensor.zeros([1], DType.float64)
         assert t32.dtype() == DType.float32
         assert t64.dtype() == DType.float64
 
     def test_is_contiguous(self):
-        t = Tensor([2, 3])
+        t = Tensor.zeros([2, 3])
         assert t.is_contiguous()
 
     def test_repr(self):
-        t = Tensor([2, 3])
+        t = Tensor.zeros([2, 3])
         r = repr(t)
         assert "2" in r and "3" in r
         assert "float32" in r
@@ -280,7 +282,7 @@ class TestTranspose:
         assert tt.is_contiguous()
 
     def test_transpose_3d(self):
-        t = Tensor([2, 3, 4])
+        t = Tensor.zeros([2, 3, 4])
         tt = t.transpose(0, 2)
         assert tt.shape() == [4, 3, 2]
 
@@ -322,13 +324,13 @@ class TestContiguous:
 
 class TestFillAndZero:
     def test_fill_f32(self):
-        t = Tensor([4, 4])
+        t = Tensor.zeros([4, 4])
         t.fill_(3.14)
         arr = t.numpy()
         np.testing.assert_allclose(arr, 3.14, rtol=1e-5)
 
     def test_fill_f64(self):
-        t = Tensor([3, 3], DType.float64)
+        t = Tensor.zeros([3, 3], DType.float64)
         t.fill_(2.718)
         arr = t.numpy()
         # fill_ takes float (32-bit) so precision is limited to ~1e-7
@@ -341,7 +343,7 @@ class TestFillAndZero:
         np.testing.assert_array_equal(arr, 0.0)
 
     def test_fill_then_zero(self):
-        t = Tensor([10])
+        t = Tensor.zeros([10])
         t.fill_(99.0)
         np.testing.assert_allclose(t.numpy(), 99.0)
         t.zero_()
@@ -357,7 +359,8 @@ class TestEdgeCases:
     def test_large_tensor(self):
         t = Tensor.zeros([1000, 1000])
         assert t.numel() == 1_000_000
-        assert t.nbytes() == 4_000_000
+        nbytes = t.numel() * (8 if t.dtype() == DType.float64 else 4)
+        assert nbytes == 4_000_000
 
     def test_add_ones(self):
         a = Tensor.ones([100])

@@ -22,7 +22,7 @@ def test_tensor_from_numpy_roundtrip():
 
 def test_tensor_shape():
     from cuDeep import Tensor
-    t = Tensor([2, 3, 4])
+    t = Tensor.zeros([2, 3, 4])
     assert t.shape() == [2, 3, 4]
     assert t.ndim() == 3
     assert t.numel() == 24

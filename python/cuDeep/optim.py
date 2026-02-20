@@ -1,8 +1,17 @@
-"""Optimizers for cuDeep."""
+"""Optimizers for cuDeep.
+
+All optimizers consume ``Parameter.grad`` populated by ``loss.backward()``.
+Call ``optimizer.zero_grad()`` before each forward pass to reset gradients.
+"""
 
 from __future__ import annotations
-
-from cuDeep._core import Tensor, sgd_update, adam_update, adamw_update
+from cuDeep._core import (
+    Tensor as _RawTensor,
+    DType,
+    sgd_update as _sgd_update,
+    adam_update as _adam_update,
+    adamw_update as _adamw_update,
+)
 
 
 class Optimizer:
@@ -12,15 +21,12 @@ class Optimizer:
         self.params = list(params)
         self.lr = lr
 
-    def step(self, grads):
-        """Apply one optimization step. grads is a list of Tensor gradients
-        matching self.params in order."""
+    def step(self):
         raise NotImplementedError
 
-    def zero_grad(self, grads):
-        """Zero out gradient tensors."""
-        for g in grads:
-            g.zero_()
+    def zero_grad(self):
+        for p in self.params:
+            p.grad = None
 
 
 class SGD(Optimizer):
@@ -30,17 +36,19 @@ class SGD(Optimizer):
         self.weight_decay = weight_decay
         self._velocity = [None] * len(self.params)
 
-    def step(self, grads):
-        for i, (param, grad) in enumerate(zip(self.params, grads)):
+    def step(self):
+        for i, param in enumerate(self.params):
+            if param.grad is None:
+                continue
             vel = self._velocity[i]
             if self.momentum != 0.0 and vel is None:
-                vel = Tensor.zeros(param.shape(), param.dtype())
+                vel = _RawTensor.zeros(list(param.shape()), param.dtype())
                 self._velocity[i] = vel
-            sgd_update(param, grad,
-                       velocity=vel,
-                       lr=self.lr,
-                       momentum=self.momentum,
-                       weight_decay=self.weight_decay)
+            _sgd_update(param._data, param.grad._data,
+                        velocity=vel,
+                        lr=self.lr,
+                        momentum=self.momentum,
+                        weight_decay=self.weight_decay)
 
 
 class Adam(Optimizer):
@@ -53,27 +61,26 @@ class Adam(Optimizer):
         self._m = [None] * len(self.params)
         self._v = [None] * len(self.params)
 
-    def step(self, grads):
+    def step(self):
         self._step_count += 1
-        for i, (param, grad) in enumerate(zip(self.params, grads)):
+        for i, param in enumerate(self.params):
+            if param.grad is None:
+                continue
             if self._m[i] is None:
-                self._m[i] = Tensor.zeros(param.shape(), param.dtype())
-                self._v[i] = Tensor.zeros(param.shape(), param.dtype())
-            adam_update(param, grad, self._m[i], self._v[i],
-                        lr=self.lr,
-                        beta1=self.betas[0],
-                        beta2=self.betas[1],
-                        eps=self.eps,
-                        weight_decay=self.weight_decay,
-                        step=self._step_count)
+                self._m[i] = _RawTensor.zeros(list(param.shape()), param.dtype())
+                self._v[i] = _RawTensor.zeros(list(param.shape()), param.dtype())
+            _adam_update(param._data, param.grad._data,
+                         self._m[i], self._v[i],
+                         lr=self.lr,
+                         beta1=self.betas[0],
+                         beta2=self.betas[1],
+                         eps=self.eps,
+                         weight_decay=self.weight_decay,
+                         step=self._step_count)
 
 
 class AdamW(Optimizer):
-    """Adam with decoupled weight decay (Loshchilov & Hutter 2019).
-
-    Weight decay is applied directly to params (param -= lr * wd * param)
-    before the Adam moment update, NOT mixed into the gradient like L2.
-    """
+    """Adam with decoupled weight decay (Loshchilov & Hutter 2019)."""
 
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2):
         super().__init__(params, lr)
@@ -84,16 +91,19 @@ class AdamW(Optimizer):
         self._m = [None] * len(self.params)
         self._v = [None] * len(self.params)
 
-    def step(self, grads):
+    def step(self):
         self._step_count += 1
-        for i, (param, grad) in enumerate(zip(self.params, grads)):
+        for i, param in enumerate(self.params):
+            if param.grad is None:
+                continue
             if self._m[i] is None:
-                self._m[i] = Tensor.zeros(param.shape(), param.dtype())
-                self._v[i] = Tensor.zeros(param.shape(), param.dtype())
-            adamw_update(param, grad, self._m[i], self._v[i],
-                         lr=self.lr,
-                         beta1=self.betas[0],
-                         beta2=self.betas[1],
-                         eps=self.eps,
-                         weight_decay=self.weight_decay,
-                         step=self._step_count)
+                self._m[i] = _RawTensor.zeros(list(param.shape()), param.dtype())
+                self._v[i] = _RawTensor.zeros(list(param.shape()), param.dtype())
+            _adamw_update(param._data, param.grad._data,
+                          self._m[i], self._v[i],
+                          lr=self.lr,
+                          beta1=self.betas[0],
+                          beta2=self.betas[1],
+                          eps=self.eps,
+                          weight_decay=self.weight_decay,
+                          step=self._step_count)

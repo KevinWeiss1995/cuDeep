@@ -1,22 +1,38 @@
-"""Neural network layers and modules."""
+"""Neural network modules with autograd support.
+
+All modules operate on ``cuDeep.tensor.Tensor`` objects. Parameters are
+created with ``requires_grad=True`` so that ``loss.backward()`` populates
+their ``.grad`` attributes automatically.
+"""
 
 from __future__ import annotations
 
-from typing import Optional
-
-from cuDeep._core import (
-    Tensor, DType,
-    relu, sigmoid, gelu, silu, tanh_act, leaky_relu,
-    conv2d_forward, broadcast_add,
+from cuDeep._core import DType
+from cuDeep.tensor import (
+    Tensor, broadcast_add, relu, sigmoid, tanh, gelu, silu, softmax,
+    conv2d, Conv2dOp,
 )
+
+
+class Parameter(Tensor):
+    """A tensor that is automatically marked as requiring gradients."""
+
+    def __init__(self, data):
+        if isinstance(data, Tensor):
+            super().__init__(data._data, requires_grad=True)
+        else:
+            super().__init__(data, requires_grad=True)
+
+    def __repr__(self):
+        return f"Parameter(shape={self.shape()}, dtype={self.dtype()})"
 
 
 class Module:
     """Base class for all neural network modules."""
 
     def __init__(self):
-        self._parameters = {}
-        self._modules = {}
+        self._parameters: dict[str, Parameter] = {}
+        self._modules: dict[str, Module] = {}
         self._training = True
 
     def forward(self, *args, **kwargs):
@@ -25,26 +41,57 @@ class Module:
     def __call__(self, *args, **kwargs):
         return self.forward(*args, **kwargs)
 
-    def parameters(self):
+    def register_parameter(self, name: str, tensor):
+        if not isinstance(tensor, Parameter):
+            tensor = Parameter(tensor)
+        self._parameters[name] = tensor
+
+    def register_module(self, name: str, module: Module):
+        self._modules[name] = module
+
+    def parameters(self) -> list[Parameter]:
         params = list(self._parameters.values())
-        for module in self._modules.values():
-            params.extend(module.parameters())
+        for mod in self._modules.values():
+            params.extend(mod.parameters())
         return params
+
+    def named_parameters(self):
+        for name, p in self._parameters.items():
+            yield name, p
+        for mod_name, mod in self._modules.items():
+            for pname, p in mod.named_parameters():
+                yield f"{mod_name}.{pname}", p
 
     def train(self, mode=True):
         self._training = mode
-        for module in self._modules.values():
-            module.train(mode)
+        for m in self._modules.values():
+            m.train(mode)
         return self
 
     def eval(self):
         return self.train(False)
 
-    def register_parameter(self, name, param):
-        self._parameters[name] = param
+    @property
+    def training(self):
+        return self._training
 
-    def register_module(self, name, module):
-        self._modules[name] = module
+    def state_dict(self) -> dict:
+        sd = {}
+        for name, p in self.named_parameters():
+            sd[name] = p.numpy()
+        return sd
+
+    def load_state_dict(self, sd: dict):
+        import numpy as np
+        params = dict(self.named_parameters())
+        for name, arr in sd.items():
+            if name in params:
+                from cuDeep._core import Tensor as _RT
+                params[name]._data = _RT.from_numpy(np.ascontiguousarray(arr))
+
+    def zero_grad(self):
+        for p in self.parameters():
+            p.grad = None
 
 
 class Linear(Module):
@@ -54,19 +101,22 @@ class Linear(Module):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.register_parameter("weight", Tensor.randn([out_features, in_features], dtype))
+        self.register_parameter(
+            "weight", Tensor.randn([out_features, in_features], dtype))
         if bias:
-            self.register_parameter("bias", Tensor.zeros([out_features], dtype))
+            self.register_parameter(
+                "bias", Tensor.zeros([out_features], dtype))
 
     def forward(self, x):
-        out = x.matmul(self._parameters["weight"].transpose(0, 1).contiguous())
+        w = self._parameters["weight"]
+        out = x.matmul(w.transpose(0, 1))
         if "bias" in self._parameters:
             out = broadcast_add(out, self._parameters["bias"])
         return out
 
 
 class Conv2d(Module):
-    """2D convolution layer."""
+    """2D convolution."""
 
     def __init__(self, in_channels, out_channels, kernel_size,
                  stride=1, padding=0, bias=True, dtype=DType.float32):
@@ -77,70 +127,63 @@ class Conv2d(Module):
             stride = (stride, stride)
         if isinstance(padding, int):
             padding = (padding, padding)
-
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.kernel_size = kernel_size
         self.stride = stride
         self.padding = padding
-
         self.register_parameter(
             "weight",
-            Tensor.randn([out_channels, in_channels, kernel_size[0], kernel_size[1]], dtype),
-        )
+            Tensor.randn([out_channels, in_channels, kernel_size[0], kernel_size[1]], dtype))
         if bias:
-            self.register_parameter("bias", Tensor.zeros([out_channels], dtype))
+            self.register_parameter(
+                "bias", Tensor.zeros([out_channels], dtype))
 
     def forward(self, x):
-        bias = self._parameters.get("bias", None)
-        return conv2d_forward(
-            x, self._parameters["weight"], bias,
-            list(self.stride), list(self.padding))
+        b = self._parameters.get("bias", None)
+        return conv2d(x, self._parameters["weight"], b,
+                      self.stride, self.padding)
 
 
 class ReLU(Module):
-    def forward(self, x):
-        return relu(x)
-
+    def forward(self, x): return x.relu()
 
 class Sigmoid(Module):
-    def forward(self, x):
-        return sigmoid(x)
-
+    def forward(self, x): return x.sigmoid()
 
 class Tanh(Module):
-    def forward(self, x):
-        return tanh_act(x)
-
+    def forward(self, x): return x.tanh()
 
 class GELU(Module):
-    def forward(self, x):
-        return gelu(x)
-
+    def forward(self, x): return x.gelu()
 
 class SiLU(Module):
-    def forward(self, x):
-        return silu(x)
-
+    def forward(self, x): return x.silu()
 
 class LeakyReLU(Module):
     def __init__(self, negative_slope=0.01):
         super().__init__()
         self.negative_slope = negative_slope
-
     def forward(self, x):
-        return leaky_relu(x, self.negative_slope)
+        from cuDeep.tensor import _LeakyReLUAlphaOp
+        return _LeakyReLUAlphaOp.apply(x, self.negative_slope)
+
+class Softmax(Module):
+    def forward(self, x): return softmax(x)
 
 
 class Sequential(Module):
-    """Sequential container that chains modules in order."""
+    """Run modules in sequence."""
 
     def __init__(self, *modules):
         super().__init__()
-        for i, mod in enumerate(modules):
-            self.register_module(str(i), mod)
+        for i, m in enumerate(modules):
+            self.register_module(str(i), m)
 
     def forward(self, x):
-        for module in self._modules.values():
-            x = module(x)
+        for m in self._modules.values():
+            x = m(x)
         return x
+
+    def __getitem__(self, idx):
+        return list(self._modules.values())[idx]
+
+    def __len__(self):
+        return len(self._modules)

@@ -96,7 +96,7 @@ class TestLossComputation:
         model = Sequential(Linear(8, 4))
         x = Tensor.randn([3, 8])
         logits = model(x)
-        probs = softmax(logits, 1)
+        probs = softmax(logits)
         arr = probs.numpy()
         assert arr.shape == (3, 4)
         np.testing.assert_allclose(arr.sum(axis=1), 1.0, rtol=1e-5)
@@ -123,7 +123,9 @@ class TestSGDTraining:
             grads = [Tensor.randn(p.shape(), p.dtype()) for p in params]
             for g in grads:
                 g.fill_(0.01)
-            opt.step(grads)
+            for p, g in zip(params, grads):
+                p.grad = g
+            opt.step()
 
         assert all(np.isfinite(l) for l in losses)
 
@@ -134,7 +136,9 @@ class TestSGDTraining:
 
         before = [p.numpy().copy() for p in params]
         grads = [Tensor.ones(p.shape(), p.dtype()) for p in params]
-        opt.step(grads)
+        for p, g in zip(params, grads):
+            p.grad = g
+        opt.step()
         after = [p.numpy() for p in params]
 
         for b, a in zip(before, after):
@@ -151,7 +155,9 @@ class TestAdamTraining:
 
         before = [p.numpy().copy() for p in params]
         grads = [Tensor.ones(p.shape(), p.dtype()) for p in params]
-        opt.step(grads)
+        for p, g in zip(params, grads):
+            p.grad = g
+        opt.step()
         after = [p.numpy() for p in params]
 
         for b, a in zip(before, after):
@@ -164,7 +170,9 @@ class TestAdamTraining:
 
         for _ in range(10):
             grads = [Tensor.randn(p.shape(), p.dtype()) for p in params]
-            opt.step(grads)
+            for p, g in zip(params, grads):
+                p.grad = g
+            opt.step()
 
         for p in params:
             assert np.all(np.isfinite(p.numpy()))

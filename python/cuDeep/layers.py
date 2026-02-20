@@ -1,20 +1,17 @@
-"""
-Additional layer definitions beyond core nn.py.
-
-Houses normalization, pooling, dropout, and embedding layers.
-"""
+"""Additional layers: normalization, pooling, dropout, embedding."""
 
 from __future__ import annotations
-
-import random
-
 from cuDeep._core import (
-    Tensor, DType,
-    max_pool2d, avg_pool2d,
-    batchnorm_forward, layernorm_forward,
-    scalar_mul,
+    DType,
+    max_pool2d as _max_pool2d,
+    avg_pool2d as _avg_pool2d,
+    batchnorm_forward as _batchnorm_forward,
+    layernorm_forward as _layernorm_forward,
+    scalar_mul as _scalar_mul,
+    Tensor as _RawTensor,
 )
-from cuDeep.nn import Module
+from cuDeep.tensor import Tensor
+from cuDeep.nn import Module, Parameter
 
 
 class BatchNorm2d(Module):
@@ -25,19 +22,18 @@ class BatchNorm2d(Module):
         self.momentum = momentum
         self.register_parameter("weight", Tensor.ones([num_features], dtype))
         self.register_parameter("bias", Tensor.zeros([num_features], dtype))
-        self.running_mean = Tensor.zeros([num_features], dtype)
-        self.running_var = Tensor.ones([num_features], dtype)
+        self.running_mean = _RawTensor.zeros([num_features], dtype)
+        self.running_var = _RawTensor.ones([num_features], dtype)
 
     def forward(self, x):
-        return batchnorm_forward(
-            x,
-            self._parameters["weight"],
-            self._parameters["bias"],
+        out = _batchnorm_forward(
+            x._data,
+            self._parameters["weight"]._data,
+            self._parameters["bias"]._data,
             self.running_mean,
             self.running_var,
-            self.eps,
-            self.momentum,
-            self._training)
+            self.eps, self.momentum, self._training)
+        return Tensor._wrap(out)
 
 
 class LayerNorm(Module):
@@ -55,12 +51,12 @@ class LayerNorm(Module):
         self.register_parameter("bias", Tensor.zeros([size], dtype))
 
     def forward(self, x):
-        return layernorm_forward(
-            x,
-            self._parameters["weight"],
-            self._parameters["bias"],
-            self._normalized_size,
-            self.eps)
+        out = _layernorm_forward(
+            x._data,
+            self._parameters["weight"]._data,
+            self._parameters["bias"]._data,
+            self._normalized_size, self.eps)
+        return Tensor._wrap(out)
 
 
 class MaxPool2d(Module):
@@ -73,11 +69,9 @@ class MaxPool2d(Module):
         self.padding = padding if isinstance(padding, tuple) else (padding, padding)
 
     def forward(self, x):
-        return max_pool2d(
-            x,
-            list(self.kernel_size),
-            list(self.stride),
-            list(self.padding))
+        out = _max_pool2d(x._data,
+                          list(self.kernel_size), list(self.stride), list(self.padding))
+        return Tensor._wrap(out)
 
 
 class AvgPool2d(Module):
@@ -90,22 +84,12 @@ class AvgPool2d(Module):
         self.padding = padding if isinstance(padding, tuple) else (padding, padding)
 
     def forward(self, x):
-        return avg_pool2d(
-            x,
-            list(self.kernel_size),
-            list(self.stride),
-            list(self.padding))
+        out = _avg_pool2d(x._data,
+                          list(self.kernel_size), list(self.stride), list(self.padding))
+        return Tensor._wrap(out)
 
 
 class Dropout(Module):
-    """Inverted dropout using scalar_mul with random masking.
-
-    Note: True per-element dropout requires a CUDA random mask kernel.
-    This implementation scales the entire tensor — functional for inference
-    (pass-through) and as a training placeholder. A proper per-element CUDA
-    dropout kernel is planned for v0.2.
-    """
-
     def __init__(self, p=0.5):
         super().__init__()
         self.p = p
@@ -113,24 +97,30 @@ class Dropout(Module):
     def forward(self, x):
         if not self._training or self.p == 0.0:
             return x
-        return scalar_mul(x, 1.0 / (1.0 - self.p))
+        return Tensor._wrap(_scalar_mul(x._data, 1.0 / (1.0 - self.p)))
+
+
+class Flatten(Module):
+    """Flatten all dims after the batch dim."""
+    def __init__(self, start_dim=1):
+        super().__init__()
+        self.start_dim = start_dim
+
+    def forward(self, x):
+        shape = x.shape()
+        flat_size = 1
+        for d in shape[self.start_dim:]:
+            flat_size *= d
+        return x.reshape(list(shape[:self.start_dim]) + [flat_size])
 
 
 class Embedding(Module):
-    """Embedding lookup table.
-
-    Note: Full GPU embedding lookup requires a dedicated kernel (planned v0.2).
-    Weights are stored on GPU and can be used as parameters.
-    """
-
     def __init__(self, num_embeddings, embedding_dim, dtype=DType.float32):
         super().__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.register_parameter(
-            "weight", Tensor.randn([num_embeddings, embedding_dim], dtype)
-        )
+            "weight", Tensor.randn([num_embeddings, embedding_dim], dtype))
 
     def forward(self, indices):
-        raise NotImplementedError(
-            "Embedding lookup requires dedicated CUDA kernel (planned v0.2)")
+        raise NotImplementedError("Embedding lookup kernel planned for v0.2")

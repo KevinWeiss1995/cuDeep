@@ -1,43 +1,71 @@
-"""Simple MLP example using cuDeep.nn."""
+"""End-to-end MLP training with cuDeep autograd.
+
+Demonstrates: model definition, forward pass, loss computation,
+automatic backward pass, optimizer step, LR scheduling, and inference.
+"""
 
 import numpy as np
+import cuDeep
+from cuDeep import Tensor, nn, optim, mse_loss, no_grad
+from cuDeep import init, lr_scheduler
 
+np.random.seed(42)
 
-def main():
-    from cuDeep import Tensor, mse_loss
-    from cuDeep.nn import Linear, ReLU, GELU, Sequential
+# ---- XOR-like regression (nonlinear) ----
+x_np = np.array([
+    [0, 0], [0, 1], [1, 0], [1, 1],
+    [0.1, 0.1], [0.1, 0.9], [0.9, 0.1], [0.9, 0.9],
+], dtype=np.float32)
+y_np = np.array([
+    [0], [1], [1], [0],
+    [0], [1], [1], [0],
+], dtype=np.float32)
 
-    model = Sequential(
-        Linear(784, 256),
-        ReLU(),
-        Linear(256, 128),
-        GELU(),
-        Linear(128, 10),
-    )
+x = Tensor.from_numpy(x_np)
+y = Tensor.from_numpy(y_np)
 
-    print(f"Model parameters: {len(model.parameters())}")
+# ---- Define model ----
+model = nn.Sequential(
+    nn.Linear(2, 32),
+    nn.ReLU(),
+    nn.Linear(32, 32),
+    nn.GELU(),
+    nn.Linear(32, 1),
+)
 
-    x = Tensor.randn([32, 784])
-    out = model(x)
-    print(f"Input shape:  {x.shape()}")
-    print(f"Output shape: {out.shape()}")
+for p in model.parameters():
+    if len(p.shape()) >= 2:
+        init.xavier_uniform_(p)
+    else:
+        init.zeros_(p)
 
-    target = Tensor.zeros([32, 10])
-    loss = mse_loss(out, target)
-    print(f"MSE Loss: {loss.numpy()[0]:.4f}")
+optimizer = optim.Adam(model.parameters(), lr=5e-3)
+scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=500, eta_min=1e-4)
 
-    from cuDeep.optim import SGD
-    opt = SGD(model.parameters(), lr=0.001)
-    print("\nTraining (5 steps):")
-    for step in range(5):
-        out = model(x)
-        loss = mse_loss(out, target)
-        grads = [Tensor.randn(p.shape(), p.dtype()) for p in model.parameters()]
-        opt.step(grads)
-        print(f"  step {step + 1}: loss = {loss.numpy()[0]:.4f}")
+print(f"cuDeep v{cuDeep.__version__} | device: {cuDeep.device_info()['name']}")
+print(f"Model params: {sum(p.numel() for p in model.parameters())}")
+print()
 
-    print("\nDone.")
+for step in range(500):
+    optimizer.zero_grad()
+    pred = model(x)
+    loss = mse_loss(pred, y)
+    loss.backward()
+    optimizer.step()
+    scheduler.step()
 
+    if step % 50 == 0:
+        print(f"step {step:3d}  loss = {loss.item():.6f}  lr = {optimizer.lr:.6f}")
 
-if __name__ == "__main__":
-    main()
+# ---- Evaluate ----
+model.eval()
+with no_grad():
+    pred = model(x).numpy().flatten()
+    print(f"\nPredictions: {np.round(pred, 3)}")
+    print(f"Targets:     {y_np.flatten()}")
+    print(f"Final loss:  {mse_loss(model(x), y).item():.6f}")
+
+# ---- State dict ----
+sd = model.state_dict()
+print(f"\nSaved state_dict with {len(sd)} parameters")
+print("Training complete!")
