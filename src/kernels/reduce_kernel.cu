@@ -7,44 +7,46 @@
 namespace cudeep {
 namespace kernels {
 
-// ---- Sum reduction ----
+// ---------------------------------------------------------------------------
+// Optimized reductions: grid-stride loop + warp shuffle
+//
+// Each thread accumulates multiple elements via grid-stride loop,
+// then does a warp-shuffle reduction, then a single shared-memory step
+// across warps. Much fewer __syncthreads() and better throughput.
+// ---------------------------------------------------------------------------
+
+// ---- Sum ----
 
 template <typename T>
 __global__ void sum_kernel(const T* input, T* output, int64_t n) {
-    __shared__ T shared[DEFAULT_BLOCK_SIZE];
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    shared[threadIdx.x] = (idx < n) ? input[idx] : static_cast<T>(0);
-    __syncthreads();
-
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) {
-            shared[threadIdx.x] += shared[threadIdx.x + s];
-        }
-        __syncthreads();
+    T acc = T(0);
+    for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+         i < n;
+         i += blockDim.x * gridDim.x) {
+        acc += input[i];
     }
 
-    if (threadIdx.x == 0) {
-        atomicAdd(output, shared[0]);
-    }
+    acc = block_reduce_sum(acc);
+
+    if (threadIdx.x == 0)
+        atomicAdd(output, acc);
 }
 
 template <typename T>
 void launch_sum_kernel(const T* input, T* output, int64_t n, cudaStream_t stream) {
     CUDEEP_CHECK_CUDA(cudaMemsetAsync(output, 0, sizeof(T), stream));
     int threads = DEFAULT_BLOCK_SIZE;
-    int blocks = ceil_div(static_cast<int>(n), threads);
+    int blocks = min(ceil_div(static_cast<int>(n), threads), 256);
     sum_kernel<<<blocks, threads, 0, stream>>>(input, output, n);
     CUDEEP_CHECK_LAST_KERNEL();
 }
 
-// ---- Mean reduction ----
+// ---- Mean ----
 
 template <typename T>
 __global__ void divide_scalar_kernel(T* val, T divisor) {
-    if (threadIdx.x == 0) {
+    if (threadIdx.x == 0)
         *val /= divisor;
-    }
 }
 
 template <typename T>
@@ -58,84 +60,126 @@ void launch_mean_kernel(const T* input, T* output, int64_t n, cudaStream_t strea
     CUDEEP_CHECK_LAST_KERNEL();
 }
 
-// ---- Max reduction (two-level) ----
+// ---- Max ----
 
 template <typename T>
-__global__ void max_reduce_kernel(const T* input, T* block_results, int64_t n) {
-    __shared__ T shared[DEFAULT_BLOCK_SIZE];
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    shared[threadIdx.x] = (idx < n) ? input[idx] : static_cast<T>(-1e38);
-    __syncthreads();
-
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) {
-            shared[threadIdx.x] = max(shared[threadIdx.x], shared[threadIdx.x + s]);
-        }
-        __syncthreads();
+__global__ void max_kernel(const T* input, T* output, int64_t n) {
+    T val = T(-1e38);
+    for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+         i < n;
+         i += blockDim.x * gridDim.x) {
+        val = max(val, input[i]);
     }
 
-    if (threadIdx.x == 0) {
-        block_results[blockIdx.x] = shared[0];
+    val = block_reduce_max(val);
+
+    if (threadIdx.x == 0)
+        atomicMax(reinterpret_cast<int*>(output),
+                  __float_as_int(val));
+}
+
+// Specialization: double doesn't have atomicMax, use CAS loop
+__device__ void atomicMaxDouble(double* addr, double val) {
+    unsigned long long int* addr_ull = reinterpret_cast<unsigned long long int*>(addr);
+    unsigned long long int old = *addr_ull, assumed;
+    do {
+        assumed = old;
+        double old_val = __longlong_as_double(assumed);
+        if (old_val >= val) break;
+        old = atomicCAS(addr_ull, assumed, __double_as_longlong(val));
+    } while (assumed != old);
+}
+
+template <>
+__global__ void max_kernel<double>(const double* input, double* output, int64_t n) {
+    double val = -1e308;
+    for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+         i < n;
+         i += blockDim.x * gridDim.x) {
+        val = fmax(val, input[i]);
     }
+
+    val = block_reduce_max(val);
+
+    if (threadIdx.x == 0)
+        atomicMaxDouble(output, val);
 }
 
 template <typename T>
 void launch_max_kernel(const T* input, T* output, int64_t n, cudaStream_t stream) {
     int threads = DEFAULT_BLOCK_SIZE;
-    int blocks = ceil_div(static_cast<int>(n), threads);
+    int blocks = min(ceil_div(static_cast<int>(n), threads), 256);
 
-    if (blocks == 1) {
-        max_reduce_kernel<<<1, threads, 0, stream>>>(input, output, n);
-        CUDEEP_CHECK_LAST_KERNEL();
-    } else {
-        T* temp = static_cast<T*>(device_malloc(blocks * sizeof(T)));
-        max_reduce_kernel<<<blocks, threads, 0, stream>>>(input, temp, n);
-        CUDEEP_CHECK_LAST_KERNEL();
-        launch_max_kernel(temp, output, static_cast<int64_t>(blocks), stream);
-        CUDEEP_CHECK_CUDA(cudaStreamSynchronize(stream));
-        device_free(temp);
-    }
+    // Initialize to -inf
+    T neg_inf;
+    if constexpr (sizeof(T) == 4)
+        neg_inf = -1e38f;
+    else
+        neg_inf = -1e308;
+    CUDEEP_CHECK_CUDA(cudaMemcpyAsync(output, &neg_inf, sizeof(T),
+                                       cudaMemcpyHostToDevice, stream));
+    max_kernel<<<blocks, threads, 0, stream>>>(input, output, n);
+    CUDEEP_CHECK_LAST_KERNEL();
 }
 
-// ---- Min reduction (two-level) ----
+// ---- Min ----
 
 template <typename T>
-__global__ void min_reduce_kernel(const T* input, T* block_results, int64_t n) {
-    __shared__ T shared[DEFAULT_BLOCK_SIZE];
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    shared[threadIdx.x] = (idx < n) ? input[idx] : static_cast<T>(1e38);
-    __syncthreads();
-
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) {
-            shared[threadIdx.x] = min(shared[threadIdx.x], shared[threadIdx.x + s]);
-        }
-        __syncthreads();
+__global__ void min_kernel(const T* input, T* output, int64_t n) {
+    T val = T(1e38);
+    for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+         i < n;
+         i += blockDim.x * gridDim.x) {
+        val = min(val, input[i]);
     }
 
-    if (threadIdx.x == 0) {
-        block_results[blockIdx.x] = shared[0];
+    val = block_reduce_min(val);
+
+    if (threadIdx.x == 0)
+        atomicMin(reinterpret_cast<int*>(output),
+                  __float_as_int(val));
+}
+
+__device__ void atomicMinDouble(double* addr, double val) {
+    unsigned long long int* addr_ull = reinterpret_cast<unsigned long long int*>(addr);
+    unsigned long long int old = *addr_ull, assumed;
+    do {
+        assumed = old;
+        double old_val = __longlong_as_double(assumed);
+        if (old_val <= val) break;
+        old = atomicCAS(addr_ull, assumed, __double_as_longlong(val));
+    } while (assumed != old);
+}
+
+template <>
+__global__ void min_kernel<double>(const double* input, double* output, int64_t n) {
+    double val = 1e308;
+    for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+         i < n;
+         i += blockDim.x * gridDim.x) {
+        val = fmin(val, input[i]);
     }
+
+    val = block_reduce_min(val);
+
+    if (threadIdx.x == 0)
+        atomicMinDouble(output, val);
 }
 
 template <typename T>
 void launch_min_kernel(const T* input, T* output, int64_t n, cudaStream_t stream) {
     int threads = DEFAULT_BLOCK_SIZE;
-    int blocks = ceil_div(static_cast<int>(n), threads);
+    int blocks = min(ceil_div(static_cast<int>(n), threads), 256);
 
-    if (blocks == 1) {
-        min_reduce_kernel<<<1, threads, 0, stream>>>(input, output, n);
-        CUDEEP_CHECK_LAST_KERNEL();
-    } else {
-        T* temp = static_cast<T*>(device_malloc(blocks * sizeof(T)));
-        min_reduce_kernel<<<blocks, threads, 0, stream>>>(input, temp, n);
-        CUDEEP_CHECK_LAST_KERNEL();
-        launch_min_kernel(temp, output, static_cast<int64_t>(blocks), stream);
-        CUDEEP_CHECK_CUDA(cudaStreamSynchronize(stream));
-        device_free(temp);
-    }
+    T pos_inf;
+    if constexpr (sizeof(T) == 4)
+        pos_inf = 1e38f;
+    else
+        pos_inf = 1e308;
+    CUDEEP_CHECK_CUDA(cudaMemcpyAsync(output, &pos_inf, sizeof(T),
+                                       cudaMemcpyHostToDevice, stream));
+    min_kernel<<<blocks, threads, 0, stream>>>(input, output, n);
+    CUDEEP_CHECK_LAST_KERNEL();
 }
 
 // ---- Sum along axis ----
@@ -152,7 +196,7 @@ __global__ void sum_along_axis_kernel(
     int64_t outer = idx / inner_size;
     int64_t inner = idx % inner_size;
 
-    T acc = static_cast<T>(0);
+    T acc = T(0);
     for (int64_t a = 0; a < axis_size; ++a) {
         acc += input[(outer * axis_size + a) * inner_size + inner];
     }
@@ -167,9 +211,7 @@ void launch_sum_along_axis_kernel(
 ) {
     int64_t outer_size = 1;
     for (int i = 0; i < axis; ++i) outer_size *= shape[i];
-
     int64_t axis_size = shape[axis];
-
     int64_t inner_size = 1;
     for (int i = axis + 1; i < ndim; ++i) inner_size *= shape[i];
 

@@ -54,24 +54,6 @@ model = Sequential(
 )
 ```
 
-## Project Structure
-
-```
-cuDeep/
-  include/cudeep/        # C++/CUDA headers
-    kernels/             # Kernel launch declarations
-  src/                   # CUDA implementations
-    kernels/             # Kernel .cu files
-    bindings/            # PyBind11 module
-  python/cuDeep/         # Python package
-  tests/                 # Unit, integration, performance tests
-  benchmarks/            # Performance benchmarks
-  examples/              # Usage examples
-  docs/                  # Documentation
-  CMakeLists.txt         # Build system
-  setup.py               # pip install
-```
-
 ## Running Tests
 
 ```bash
