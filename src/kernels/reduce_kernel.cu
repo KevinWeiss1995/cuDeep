@@ -62,6 +62,26 @@ void launch_mean_kernel(const T* input, T* output, int64_t n, cudaStream_t strea
 
 // ---- Max ----
 
+__device__ void atomicMaxFloat(float* addr, float val) {
+    int* addr_int = reinterpret_cast<int*>(addr);
+    int old = *addr_int, assumed;
+    do {
+        assumed = old;
+        if (__int_as_float(assumed) >= val) break;
+        old = atomicCAS(addr_int, assumed, __float_as_int(val));
+    } while (assumed != old);
+}
+
+__device__ void atomicMaxDouble(double* addr, double val) {
+    unsigned long long int* addr_ull = reinterpret_cast<unsigned long long int*>(addr);
+    unsigned long long int old = *addr_ull, assumed;
+    do {
+        assumed = old;
+        if (__longlong_as_double(assumed) >= val) break;
+        old = atomicCAS(addr_ull, assumed, __double_as_longlong(val));
+    } while (assumed != old);
+}
+
 template <typename T>
 __global__ void max_kernel(const T* input, T* output, int64_t n) {
     T val = T(-1e38);
@@ -74,20 +94,7 @@ __global__ void max_kernel(const T* input, T* output, int64_t n) {
     val = block_reduce_max(val);
 
     if (threadIdx.x == 0)
-        atomicMax(reinterpret_cast<int*>(output),
-                  __float_as_int(val));
-}
-
-// Specialization: double doesn't have atomicMax, use CAS loop
-__device__ void atomicMaxDouble(double* addr, double val) {
-    unsigned long long int* addr_ull = reinterpret_cast<unsigned long long int*>(addr);
-    unsigned long long int old = *addr_ull, assumed;
-    do {
-        assumed = old;
-        double old_val = __longlong_as_double(assumed);
-        if (old_val >= val) break;
-        old = atomicCAS(addr_ull, assumed, __double_as_longlong(val));
-    } while (assumed != old);
+        atomicMaxFloat(reinterpret_cast<float*>(output), static_cast<float>(val));
 }
 
 template <>
@@ -124,6 +131,26 @@ void launch_max_kernel(const T* input, T* output, int64_t n, cudaStream_t stream
 
 // ---- Min ----
 
+__device__ void atomicMinFloat(float* addr, float val) {
+    int* addr_int = reinterpret_cast<int*>(addr);
+    int old = *addr_int, assumed;
+    do {
+        assumed = old;
+        if (__int_as_float(assumed) <= val) break;
+        old = atomicCAS(addr_int, assumed, __float_as_int(val));
+    } while (assumed != old);
+}
+
+__device__ void atomicMinDouble(double* addr, double val) {
+    unsigned long long int* addr_ull = reinterpret_cast<unsigned long long int*>(addr);
+    unsigned long long int old = *addr_ull, assumed;
+    do {
+        assumed = old;
+        if (__longlong_as_double(assumed) <= val) break;
+        old = atomicCAS(addr_ull, assumed, __double_as_longlong(val));
+    } while (assumed != old);
+}
+
 template <typename T>
 __global__ void min_kernel(const T* input, T* output, int64_t n) {
     T val = T(1e38);
@@ -136,19 +163,7 @@ __global__ void min_kernel(const T* input, T* output, int64_t n) {
     val = block_reduce_min(val);
 
     if (threadIdx.x == 0)
-        atomicMin(reinterpret_cast<int*>(output),
-                  __float_as_int(val));
-}
-
-__device__ void atomicMinDouble(double* addr, double val) {
-    unsigned long long int* addr_ull = reinterpret_cast<unsigned long long int*>(addr);
-    unsigned long long int old = *addr_ull, assumed;
-    do {
-        assumed = old;
-        double old_val = __longlong_as_double(assumed);
-        if (old_val <= val) break;
-        old = atomicCAS(addr_ull, assumed, __double_as_longlong(val));
-    } while (assumed != old);
+        atomicMinFloat(reinterpret_cast<float*>(output), static_cast<float>(val));
 }
 
 template <>
