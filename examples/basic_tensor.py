@@ -1,5 +1,12 @@
 """Basic tensor operations with cuDeep."""
 
+import sys
+from pathlib import Path
+
+_root = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_root / "python"))
+sys.path.insert(0, str(_root / "build"))
+
 import numpy as np
 
 

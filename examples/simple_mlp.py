@@ -4,6 +4,13 @@ Demonstrates: model definition, forward pass, loss computation,
 automatic backward pass, optimizer step, LR scheduling, and inference.
 """
 
+import sys
+from pathlib import Path
+
+_root = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_root / "python"))
+sys.path.insert(0, str(_root / "build"))
+
 import numpy as np
 import cuDeep
 from cuDeep import Tensor, nn, optim, mse_loss, no_grad
