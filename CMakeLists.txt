@@ -14,7 +14,13 @@ option(CUDEEP_BUILD_PYTHON "Build Python bindings" ON)
 # ---- CUDA setup ----
 find_package(CUDAToolkit REQUIRED)
 
-set(CMAKE_CUDA_ARCHITECTURES "70;75;80;86;89;90" CACHE STRING "CUDA architectures")
+set(CMAKE_CUDA_ARCHITECTURES "70;75;80;86;87;89;90" CACHE STRING "CUDA architectures")
+
+# Aggressive optimisation — --use_fast_math enables __expf, __logf, fused
+# multiply-add, and denormal-flush-to-zero.  --extra-device-vectorization
+# tells ptxas to try harder on register allocation / ILP.
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 --use_fast_math --extra-device-vectorization")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-extended-lambda --expt-relaxed-constexpr")
 
 # ---- Core library sources ----
 set(CUDEEP_SOURCES

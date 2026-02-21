@@ -225,7 +225,30 @@ __global__ void layernorm_forward_kernel(
     T mean    = s_mean;
     T inv_std = s_inv_std;
 
-    for (int i = threadIdx.x; i < normalized_size; i += blockDim.x) {
+    // Vectorized write-back for float path
+    int i = threadIdx.x;
+    for (; i + 3 < normalized_size; i += blockDim.x * 4) {
+        // Process 4 elements if they're all in range
+        int base = i;
+        if (base + 3 < normalized_size && sizeof(T) == 4) {
+            // Unrolled scalar (compiler will vectorize with --use_fast_math)
+            T x0 = (in_row[base + 0] - mean) * inv_std;
+            T x1 = (in_row[base + 1] - mean) * inv_std;
+            T x2 = (in_row[base + 2] - mean) * inv_std;
+            T x3 = (in_row[base + 3] - mean) * inv_std;
+            out_row[base + 0] = weight[base + 0] * x0 + bias[base + 0];
+            out_row[base + 1] = weight[base + 1] * x1 + bias[base + 1];
+            out_row[base + 2] = weight[base + 2] * x2 + bias[base + 2];
+            out_row[base + 3] = weight[base + 3] * x3 + bias[base + 3];
+        } else {
+            for (int j = 0; j < 4 && base + j < normalized_size; ++j) {
+                T x_hat = (in_row[base + j] - mean) * inv_std;
+                out_row[base + j] = weight[base + j] * x_hat + bias[base + j];
+            }
+        }
+    }
+    // Remainder
+    for (; i < normalized_size; i += blockDim.x) {
         T x_hat = (in_row[i] - mean) * inv_std;
         out_row[i] = weight[i] * x_hat + bias[i];
     }

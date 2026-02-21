@@ -47,10 +47,18 @@ inline int ceil_div(int a, int b) {
     return (a + b - 1) / b;
 }
 
+inline int64_t ceil_div64(int64_t a, int64_t b) {
+    return (a + b - 1) / b;
+}
+
 // ---------------------------------------------------------------------------
-// Warp-level reduction intrinsics (CUDA device code only)
+// CUDA device code only
 // ---------------------------------------------------------------------------
 #ifdef __CUDACC__
+
+// ---------------------------------------------------------------------------
+// Warp-level reduction intrinsics
+// ---------------------------------------------------------------------------
 
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     #pragma unroll
@@ -74,12 +82,11 @@ __device__ __forceinline__ float warp_reduce_min(float val) {
 }
 
 __device__ __forceinline__ double shfl_down_double(double val, int offset) {
-    int2 tmp = __double_as_longlong(val) >= 0
-        ? make_int2(__double2loint(val), __double2hiint(val))
-        : make_int2(__double2loint(val), __double2hiint(val));
-    tmp.x = __shfl_down_sync(0xffffffff, tmp.x, offset);
-    tmp.y = __shfl_down_sync(0xffffffff, tmp.y, offset);
-    return __hiloint2double(tmp.y, tmp.x);
+    int lo = __double2loint(val);
+    int hi = __double2hiint(val);
+    lo = __shfl_down_sync(0xffffffff, lo, offset);
+    hi = __shfl_down_sync(0xffffffff, hi, offset);
+    return __hiloint2double(hi, lo);
 }
 
 __device__ __forceinline__ double warp_reduce_sum(double val) {
@@ -103,7 +110,10 @@ __device__ __forceinline__ double warp_reduce_min(double val) {
     return val;
 }
 
-// Block-wide reduction using warp shuffles. Requires blockDim.x <= 1024.
+// ---------------------------------------------------------------------------
+// Block-wide reductions using warp shuffles. blockDim.x <= 1024.
+// ---------------------------------------------------------------------------
+
 template <typename T>
 __device__ __forceinline__ T block_reduce_sum(T val) {
     __shared__ T warp_sums[32];
@@ -153,7 +163,7 @@ __device__ __forceinline__ T block_reduce_min(T val) {
 }
 
 // ---------------------------------------------------------------------------
-// Vectorized load/store traits
+// Vectorized load/store traits — 128-bit aligned
 // ---------------------------------------------------------------------------
 
 template <typename T> struct Vec4;
@@ -177,6 +187,76 @@ template <> struct Vec4<double> {
         *reinterpret_cast<double2*>(p) = v;
     }
 };
+
+// ---------------------------------------------------------------------------
+// Async copy helpers (SM 80+ / Ampere+)
+// Uses cp.async to copy directly from global → shared memory, bypassing
+// the register file. Dramatically reduces register pressure and enables
+// true overlap of global loads with shared memory computation.
+// ---------------------------------------------------------------------------
+
+#if __CUDA_ARCH__ >= 800
+
+__device__ __forceinline__ void cp_async_f4(void* smem_dst, const void* global_src) {
+    uint32_t smem_addr = static_cast<uint32_t>(
+        __cvta_generic_to_shared(smem_dst));
+    asm volatile(
+        "cp.async.cg.shared.global [%0], [%1], 16;\n"
+        :: "r"(smem_addr), "l"(global_src) : "memory"
+    );
+}
+
+__device__ __forceinline__ void cp_async_f4_zfill(
+    void* smem_dst, const void* global_src, bool pred
+) {
+    uint32_t smem_addr = static_cast<uint32_t>(
+        __cvta_generic_to_shared(smem_dst));
+    asm volatile(
+        "{\n"
+        "  .reg .pred p;\n"
+        "  setp.ne.b32 p, %2, 0;\n"
+        "  @!p st.shared.v4.b32 [%0], {0, 0, 0, 0};\n"
+        "  @p cp.async.cg.shared.global [%0], [%1], 16;\n"
+        "}\n"
+        :: "r"(smem_addr), "l"(global_src), "r"((int)pred) : "memory"
+    );
+}
+
+__device__ __forceinline__ void cp_async_commit() {
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+}
+
+__device__ __forceinline__ void cp_async_wait_all() {
+    asm volatile("cp.async.wait_all;\n" ::: "memory");
+}
+
+template <int N>
+__device__ __forceinline__ void cp_async_wait_group() {
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N) : "memory");
+}
+
+#else
+
+__device__ __forceinline__ void cp_async_commit() {}
+__device__ __forceinline__ void cp_async_wait_all() {}
+template <int N>
+__device__ __forceinline__ void cp_async_wait_group() {}
+
+#endif  // __CUDA_ARCH__ >= 800
+
+// ---------------------------------------------------------------------------
+// Fast math wrappers — use hardware SFU where available
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ float fast_exp(float x) { return __expf(x); }
+__device__ __forceinline__ float fast_tanh(float x) {
+    // tanhf is already fast under --use_fast_math and handles overflow
+    return tanhf(x);
+}
+__device__ __forceinline__ float fast_sigmoid(float x) {
+    return 1.0f / (1.0f + __expf(-x));
+}
+__device__ __forceinline__ float fast_rsqrt(float x) { return rsqrtf(x); }
 
 #endif  // __CUDACC__
 
