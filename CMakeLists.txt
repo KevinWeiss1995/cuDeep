@@ -81,6 +81,32 @@ if(CUDEEP_BUILD_PYTHON)
     )
 endif()
 
+# ---- Benchmarks ----
+if(CUDEEP_BUILD_BENCHMARKS)
+    find_library(CUDNN_LIB cudnn HINTS ${CUDAToolkit_LIBRARY_DIR} /usr/lib/aarch64-linux-gnu /usr/lib/x86_64-linux-gnu)
+    find_path(CUDNN_INCLUDE cudnn.h HINTS ${CUDAToolkit_INCLUDE_DIRS} /usr/include)
+
+    if(CUDNN_LIB AND CUDNN_INCLUDE)
+        add_executable(bench_vs_reference benchmarks/bench_vs_reference.cu)
+        target_link_libraries(bench_vs_reference PRIVATE cudeep CUDA::cublas ${CUDNN_LIB})
+        target_include_directories(bench_vs_reference PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include ${CUDNN_INCLUDE})
+        set_target_properties(bench_vs_reference PROPERTIES
+            CUDA_SEPARABLE_COMPILATION ON
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/benchmarks)
+        message(STATUS "cuDNN found: ${CUDNN_LIB} — bench_vs_reference enabled")
+    else()
+        message(WARNING "cuDNN not found — bench_vs_reference will NOT be built")
+    endif()
+
+    add_executable(bench_sgemm benchmarks/bench_sgemm.cu)
+    target_link_libraries(bench_sgemm PRIVATE cudeep CUDA::cublas)
+    target_include_directories(bench_sgemm PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    set_target_properties(bench_sgemm PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/benchmarks)
+endif()
+
 # ---- Tests ----
 if(CUDEEP_BUILD_TESTS)
     enable_testing()

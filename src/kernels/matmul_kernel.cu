@@ -102,9 +102,10 @@ void sgemm_tc_kernel(const float* __restrict__ A,
             acc[mi][ni][2] = 0.f; acc[mi][ni][3] = 0.f;
         }
 
-    // A load mapping — scalar, column-major for perfect global coalescing
-    const int a_col = tid % BK;
-    const int a_row0 = tid / BK;
+    // A load mapping — vectorized float4, then scatter-transpose to As[k][m]
+    // 256 threads, each loads 2 float4's → 128 rows × 16 cols = 2048 floats
+    const int a_f4_row = tid / 4;        // 0..63
+    const int a_f4_col = (tid % 4) * 4;  // 0, 4, 8, 12
 
     // B load mapping — 2 float4 per thread via cp.async
     const int b_row0 = tid / 32;
@@ -112,11 +113,24 @@ void sgemm_tc_kernel(const float* __restrict__ A,
     const int b_row1 = 8 + b_row0;
 
     // ---- Tile loaders ----
+    // A: load float4 from row-major A, scatter-transpose into As[k][m]
     #define LOAD_A(buf, bk_off) do {                                         \
-        const float* _Ab = A + bm * K + (bk_off) + a_col;                   \
-        _Pragma("unroll")                                                     \
-        for (int _s = 0; _s < 8; ++_s)                                      \
-            As[buf][a_col][a_row0 + _s * 16] = _Ab[(a_row0 + _s * 16) * K]; \
+        {                                                                     \
+            const float* _src0 = &A[(bm + a_f4_row) * K + (bk_off) + a_f4_col]; \
+            float4 _v0 = *reinterpret_cast<const float4*>(_src0);           \
+            As[buf][a_f4_col    ][a_f4_row]      = _v0.x;                   \
+            As[buf][a_f4_col + 1][a_f4_row]      = _v0.y;                   \
+            As[buf][a_f4_col + 2][a_f4_row]      = _v0.z;                   \
+            As[buf][a_f4_col + 3][a_f4_row]      = _v0.w;                   \
+        }                                                                     \
+        {                                                                     \
+            const float* _src1 = &A[(bm + a_f4_row + 64) * K + (bk_off) + a_f4_col]; \
+            float4 _v1 = *reinterpret_cast<const float4*>(_src1);           \
+            As[buf][a_f4_col    ][a_f4_row + 64] = _v1.x;                   \
+            As[buf][a_f4_col + 1][a_f4_row + 64] = _v1.y;                   \
+            As[buf][a_f4_col + 2][a_f4_row + 64] = _v1.z;                   \
+            As[buf][a_f4_col + 3][a_f4_row + 64] = _v1.w;                   \
+        }                                                                     \
     } while(0)
 
     #define LOAD_B(buf, bk_off) do {                                         \
@@ -129,9 +143,20 @@ void sgemm_tc_kernel(const float* __restrict__ A,
     } while(0)
 
     // ---- MMA compute macro ----
+    // B fragments hoisted outside the M-tile loop to halve shared memory reads.
+    // Per k-step: load 8 B tile pairs once, reuse across both M-tiles.
     #define TC_COMPUTE(buf) do {                                             \
         _Pragma("unroll")                                                     \
         for (int _kk = 0; _kk < BK; _kk += MMA_K) {                        \
+            uint32_t _breg[MMA_TILES_N][2];                                  \
+            _Pragma("unroll")                                                 \
+            for (int _ni = 0; _ni < MMA_TILES_N; ++_ni) {                   \
+                int _bn = warp_n * TC_WN + _ni * MMA_N;                     \
+                _breg[_ni][0] = __float_as_uint(                             \
+                    Bs[buf][_kk + tg*2    ][_bn + gid]);                     \
+                _breg[_ni][1] = __float_as_uint(                             \
+                    Bs[buf][_kk + tg*2 + 1][_bn + gid]);                    \
+            }                                                                 \
             _Pragma("unroll")                                                 \
             for (int _mi = 0; _mi < MMA_TILES_M; ++_mi) {                   \
                 int _am = warp_m * TC_WM + _mi * MMA_M;                     \
@@ -145,15 +170,11 @@ void sgemm_tc_kernel(const float* __restrict__ A,
                     As[buf][_kk + tg*2 + 1][_am + gid + 8]);                \
                 _Pragma("unroll")                                             \
                 for (int _ni = 0; _ni < MMA_TILES_N; ++_ni) {               \
-                    int _bn = warp_n * TC_WN + _ni * MMA_N;                 \
-                    uint32_t _b0 = __float_as_uint(                          \
-                        Bs[buf][_kk + tg*2    ][_bn + gid]);                \
-                    uint32_t _b1 = __float_as_uint(                          \
-                        Bs[buf][_kk + tg*2 + 1][_bn + gid]);               \
                     ptx::mma_m16n8k8_tf32(                                   \
                         acc[_mi][_ni][0], acc[_mi][_ni][1],                  \
                         acc[_mi][_ni][2], acc[_mi][_ni][3],                  \
-                        _a0, _a1, _a2, _a3, _b0, _b1,                       \
+                        _a0, _a1, _a2, _a3,                                  \
+                        _breg[_ni][0], _breg[_ni][1],                        \
                         acc[_mi][_ni][0], acc[_mi][_ni][1],                  \
                         acc[_mi][_ni][2], acc[_mi][_ni][3]);                 \
                 }                                                             \
@@ -200,6 +221,174 @@ void sgemm_tc_kernel(const float* __restrict__ A,
                 make_float2(acc[mi][ni][0], acc[mi][ni][1]);
             *reinterpret_cast<float2*>(&C[row1 * N + col]) =
                 make_float2(acc[mi][ni][2], acc[mi][ni][3]);
+        }
+    }
+}
+
+// ===========================================================================
+//  Path 1b: TF32 Tensor Core — general (any M, N, K with bounds checking)
+//
+//  Identical compute to sgemm_tc_kernel, but tile loads are bounds-checked
+//  and C stores guard against out-of-range writes.  Edge blocks pay a small
+//  penalty; interior blocks execute the same fast path as the aligned kernel.
+// ===========================================================================
+
+__global__ __launch_bounds__(NUM_THREADS, 2)
+void sgemm_tc_general_kernel(const float* __restrict__ A,
+                              const float* __restrict__ B,
+                              float* __restrict__ C,
+                              int M, int N, int K) {
+
+    __shared__ float As[2][BK][SMEM_A_STRIDE];
+    __shared__ float Bs[2][BK][SMEM_B_STRIDE];
+
+    const int bm = blockIdx.y * BM;
+    const int bn = blockIdx.x * BN;
+    const int tid = threadIdx.x;
+
+    const int warp_id = tid / 32;
+    const int lane = tid % 32;
+    const int warp_m = warp_id / TC_WARPS_N;
+    const int warp_n = warp_id % TC_WARPS_N;
+    const int gid = lane / 4;
+    const int tg  = lane % 4;
+
+    float acc[MMA_TILES_M][MMA_TILES_N][4];
+    #pragma unroll
+    for (int mi = 0; mi < MMA_TILES_M; ++mi)
+        #pragma unroll
+        for (int ni = 0; ni < MMA_TILES_N; ++ni) {
+            acc[mi][ni][0] = 0.f; acc[mi][ni][1] = 0.f;
+            acc[mi][ni][2] = 0.f; acc[mi][ni][3] = 0.f;
+        }
+
+    const int a_col  = tid % BK;
+    const int a_row0 = tid / BK;
+    const int b_row0 = tid / 32;
+    const int b_col4 = tid % 32;
+    const int b_row1 = 8 + b_row0;
+
+    // Precompute whether this block is fully interior (skip bounds checks)
+    const bool m_interior = (bm + BM <= M);
+    const bool n_interior = (bn + BN <= N);
+
+    #define LOAD_A_G(buf, bk_off) do {                                       \
+        _Pragma("unroll")                                                     \
+        for (int _s = 0; _s < 8; ++_s) {                                    \
+            int _gr = bm + a_row0 + _s * 16;                                \
+            int _gc = (bk_off) + a_col;                                      \
+            As[buf][a_col][a_row0 + _s * 16] =                              \
+                (_gr < M && _gc < K) ? A[_gr * K + _gc] : 0.0f;            \
+        }                                                                     \
+    } while(0)
+
+    // cp.async requires 16-byte aligned global address; when N%4 != 0
+    // the start of a row may be misaligned, so we need a runtime check.
+    const bool b_row_aligned = (N & 3) == 0;
+
+    #define LOAD_B_G(buf, bk_off) do {                                       \
+        auto _lb = [&](int _br) {                                           \
+            int _gr = (bk_off) + _br;                                        \
+            int _gc = bn + b_col4 * 4;                                       \
+            if (b_row_aligned && _gr < K && _gc + 3 < N) {                  \
+                ptx::cp_async_cg_16(                                          \
+                    &Bs[buf][_br][b_col4 * 4],                               \
+                    &B[_gr * N + _gc]);                                      \
+            } else {                                                          \
+                Bs[buf][_br][b_col4*4+0] =                                   \
+                    (_gr < K && _gc+0 < N) ? B[_gr*N+_gc+0] : 0.0f;        \
+                Bs[buf][_br][b_col4*4+1] =                                   \
+                    (_gr < K && _gc+1 < N) ? B[_gr*N+_gc+1] : 0.0f;        \
+                Bs[buf][_br][b_col4*4+2] =                                   \
+                    (_gr < K && _gc+2 < N) ? B[_gr*N+_gc+2] : 0.0f;        \
+                Bs[buf][_br][b_col4*4+3] =                                   \
+                    (_gr < K && _gc+3 < N) ? B[_gr*N+_gc+3] : 0.0f;        \
+            }                                                                 \
+        };                                                                    \
+        _lb(b_row0);                                                         \
+        _lb(b_row1);                                                         \
+    } while(0)
+
+    #define TC_COMPUTE_G(buf) do {                                           \
+        _Pragma("unroll")                                                     \
+        for (int _kk = 0; _kk < BK; _kk += MMA_K) {                        \
+            uint32_t _breg[MMA_TILES_N][2];                                  \
+            _Pragma("unroll")                                                 \
+            for (int _ni = 0; _ni < MMA_TILES_N; ++_ni) {                   \
+                int _bn = warp_n * TC_WN + _ni * MMA_N;                     \
+                _breg[_ni][0] = __float_as_uint(                             \
+                    Bs[buf][_kk + tg*2    ][_bn + gid]);                     \
+                _breg[_ni][1] = __float_as_uint(                             \
+                    Bs[buf][_kk + tg*2 + 1][_bn + gid]);                    \
+            }                                                                 \
+            _Pragma("unroll")                                                 \
+            for (int _mi = 0; _mi < MMA_TILES_M; ++_mi) {                   \
+                int _am = warp_m * TC_WM + _mi * MMA_M;                     \
+                uint32_t _a0 = __float_as_uint(                              \
+                    As[buf][_kk + tg*2    ][_am + gid    ]);                 \
+                uint32_t _a1 = __float_as_uint(                              \
+                    As[buf][_kk + tg*2    ][_am + gid + 8]);                \
+                uint32_t _a2 = __float_as_uint(                              \
+                    As[buf][_kk + tg*2 + 1][_am + gid    ]);                \
+                uint32_t _a3 = __float_as_uint(                              \
+                    As[buf][_kk + tg*2 + 1][_am + gid + 8]);                \
+                _Pragma("unroll")                                             \
+                for (int _ni = 0; _ni < MMA_TILES_N; ++_ni) {               \
+                    ptx::mma_m16n8k8_tf32(                                   \
+                        acc[_mi][_ni][0], acc[_mi][_ni][1],                  \
+                        acc[_mi][_ni][2], acc[_mi][_ni][3],                  \
+                        _a0, _a1, _a2, _a3,                                  \
+                        _breg[_ni][0], _breg[_ni][1],                        \
+                        acc[_mi][_ni][0], acc[_mi][_ni][1],                  \
+                        acc[_mi][_ni][2], acc[_mi][_ni][3]);                 \
+                }                                                             \
+            }                                                                 \
+        }                                                                     \
+    } while(0)
+
+    int num_tiles = (K + BK - 1) / BK;
+
+    LOAD_A_G(0, 0);
+    LOAD_B_G(0, 0);
+    ptx::cp_async_commit();
+    ptx::cp_async_wait_all();
+    __syncthreads();
+
+    int buf = 0;
+    for (int t = 0; t < num_tiles - 1; ++t) {
+        LOAD_A_G(1 - buf, (t + 1) * BK);
+        LOAD_B_G(1 - buf, (t + 1) * BK);
+        ptx::cp_async_commit();
+        TC_COMPUTE_G(buf);
+        ptx::cp_async_wait_all();
+        buf = 1 - buf;
+        __syncthreads();
+    }
+    TC_COMPUTE_G(buf);
+
+    #undef LOAD_A_G
+    #undef LOAD_B_G
+    #undef TC_COMPUTE_G
+
+    // Store C with bounds checking — use float2 when both elements are valid
+    #pragma unroll
+    for (int mi = 0; mi < MMA_TILES_M; ++mi) {
+        int row0 = bm + warp_m * TC_WM + mi * MMA_M + gid;
+        int row1 = row0 + 8;
+        #pragma unroll
+        for (int ni = 0; ni < MMA_TILES_N; ++ni) {
+            int col = bn + warp_n * TC_WN + ni * MMA_N + tg * 2;
+            if (m_interior && n_interior) {
+                *reinterpret_cast<float2*>(&C[row0 * N + col]) =
+                    make_float2(acc[mi][ni][0], acc[mi][ni][1]);
+                *reinterpret_cast<float2*>(&C[row1 * N + col]) =
+                    make_float2(acc[mi][ni][2], acc[mi][ni][3]);
+            } else {
+                if (row0 < M && col     < N) C[row0 * N + col]     = acc[mi][ni][0];
+                if (row0 < M && col + 1 < N) C[row0 * N + col + 1] = acc[mi][ni][1];
+                if (row1 < M && col     < N) C[row1 * N + col]     = acc[mi][ni][2];
+                if (row1 < M && col + 1 < N) C[row1 * N + col + 1] = acc[mi][ni][3];
+            }
         }
     }
 }
@@ -517,8 +706,12 @@ void launch_matmul_kernel<float>(const float* A, const float* B, float* C,
     dim3 blocks(ceil_div(N, BN), ceil_div(M, BM));
     bool aligned = (M % BM == 0) && (N % BN == 0) && (K % BK == 0);
 
-    if (aligned && has_tensor_cores()) {
-        sgemm_tc_kernel<<<blocks, NUM_THREADS, 0, stream>>>(A, B, C, M, N, K);
+    if (has_tensor_cores()) {
+        if (aligned) {
+            sgemm_tc_kernel<<<blocks, NUM_THREADS, 0, stream>>>(A, B, C, M, N, K);
+        } else {
+            sgemm_tc_general_kernel<<<blocks, NUM_THREADS, 0, stream>>>(A, B, C, M, N, K);
+        }
     } else if (aligned && (N % 4 == 0)) {
         sgemm_fast_kernel<<<blocks, NUM_THREADS, 0, stream>>>(A, B, C, M, N, K);
     } else {
