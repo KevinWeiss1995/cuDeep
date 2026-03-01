@@ -87,11 +87,22 @@ struct BenchResult {
     double cudeep_gflops;
     double ref_gflops;
 
-    double ratio() const { return ref_ms > 0 ? cudeep_ms / ref_ms : 0; }
-    double pct_of_ref() const { return ref_gflops > 0 ? cudeep_gflops / ref_gflops * 100.0 : 0; }
+    double speedup() const { return ref_ms > 0 ? ref_ms / cudeep_ms : 0; }
+    bool is_win()  const { return cudeep_ms < ref_ms * 0.97; }
+    bool is_loss() const { return cudeep_ms > ref_ms * 1.03; }
+    bool is_tie()  const { return !is_win() && !is_loss(); }
 };
 
 using BenchFn = std::function<void()>;
+
+// ANSI color codes
+#define C_RESET   "\033[0m"
+#define C_GREEN   "\033[1;32m"
+#define C_RED     "\033[1;31m"
+#define C_YELLOW  "\033[1;33m"
+#define C_CYAN    "\033[1;36m"
+#define C_BOLD    "\033[1m"
+#define C_DIM     "\033[2m"
 
 static float timed_run(BenchFn fn, int warmup, int iters) {
     for (int i = 0; i < warmup; ++i) fn();
@@ -114,31 +125,54 @@ static float timed_run(BenchFn fn, int warmup, int iters) {
 }
 
 static void print_header() {
-    printf("  %-36s %10s %10s %10s %10s %8s\n",
-           "Kernel", "cuDeep ms", "Ref ms", "cuDeep GF", "Ref GF", "Ratio");
-    printf("  %-36s %10s %10s %10s %10s %8s\n",
-           "------------------------------------",
-           "----------", "----------", "----------", "----------", "--------");
+    printf("  %-34s %9s %9s %9s %9s  %-18s\n",
+           "Kernel", "cuDeep", "Ref", "cuDeep", "Ref", "");
+    printf("  %-34s %9s %9s %9s %9s  %-18s\n",
+           "", "(ms)", "(ms)", "(GF|GB)", "(GF|GB)", "VERDICT");
+    printf("  %s\n", std::string(100, '-').c_str());
 }
 
 static void print_result(const BenchResult& r) {
     char cudeep_gf[16], ref_gf[16];
-    if (r.cudeep_gflops > 0) snprintf(cudeep_gf, sizeof(cudeep_gf), "%10.1f", r.cudeep_gflops);
-    else snprintf(cudeep_gf, sizeof(cudeep_gf), "%10s", "-");
-    if (r.ref_gflops > 0) snprintf(ref_gf, sizeof(ref_gf), "%10.1f", r.ref_gflops);
-    else snprintf(ref_gf, sizeof(ref_gf), "%10s", "-");
+    if (r.cudeep_gflops > 0) snprintf(cudeep_gf, sizeof(cudeep_gf), "%9.1f", r.cudeep_gflops);
+    else snprintf(cudeep_gf, sizeof(cudeep_gf), "%9s", "-");
+    if (r.ref_gflops > 0) snprintf(ref_gf, sizeof(ref_gf), "%9.1f", r.ref_gflops);
+    else snprintf(ref_gf, sizeof(ref_gf), "%9s", "-");
 
-    printf("  %-36s %10.3f %10.3f %s %s %7.1f%%\n",
+    double sp = r.speedup();
+    char verdict[64];
+
+    if (r.is_win())
+        snprintf(verdict, sizeof(verdict), "%s>>> %.2fx FASTER%s", C_GREEN, sp, C_RESET);
+    else if (r.is_loss())
+        snprintf(verdict, sizeof(verdict), "%s<<< %.2fx SLOWER%s", C_RED, 1.0/sp, C_RESET);
+    else
+        snprintf(verdict, sizeof(verdict), "%s=== TIED%s", C_YELLOW, C_RESET);
+
+    printf("  %-34s %9.3f %9.3f %s %s  %s\n",
            r.name.c_str(), r.cudeep_ms, r.ref_ms,
-           cudeep_gf, ref_gf, r.pct_of_ref());
+           cudeep_gf, ref_gf, verdict);
 }
 
-static void print_section(const char* title, const std::vector<BenchResult>& results) {
-    printf("\n%s\n", std::string(90, '=').c_str());
-    printf("  %s\n", title);
-    printf("%s\n", std::string(90, '=').c_str());
+static void print_section(const char* title, const char* ref_lib,
+                           const std::vector<BenchResult>& results) {
+    int wins = 0, losses = 0, ties = 0;
+    for (auto& r : results) {
+        if (r.is_win()) wins++;
+        else if (r.is_loss()) losses++;
+        else ties++;
+    }
+
+    printf("\n%s\n", std::string(104, '=').c_str());
+    printf("  %s%s%s  (vs %s%s%s)\n", C_BOLD, title, C_RESET, C_CYAN, ref_lib, C_RESET);
+    printf("%s\n", std::string(104, '=').c_str());
     print_header();
     for (auto& r : results) print_result(r);
+
+    printf("  %s\n", std::string(100, '-').c_str());
+    printf("  Scorecard:  %s%d WIN%s", C_GREEN, wins, C_RESET);
+    printf("  /  %s%d LOSS%s", C_RED, losses, C_RESET);
+    printf("  /  %s%d TIE%s\n", C_YELLOW, ties, C_RESET);
 }
 
 // ---------------------------------------------------------------------------
@@ -745,57 +779,77 @@ int main() {
                         (prop.memoryBusWidth / 8.0f) / 1e9f;
 
     printf("\n");
-    printf("%s\n", std::string(90, '=').c_str());
-    printf("  cuDeep vs cuBLAS + cuDNN — Reference Benchmark\n");
-    printf("%s\n", std::string(90, '=').c_str());
-    printf("  Device            : %s\n", prop.name);
-    printf("  Compute Cap       : %d.%d\n", prop.major, prop.minor);
-    printf("  SMs               : %d\n", prop.multiProcessorCount);
-    printf("  GPU Clock         : %.0f MHz\n", prop.clockRate / 1e3f);
-    printf("  VRAM              : %zu MB\n", prop.totalGlobalMem >> 20);
-    printf("  Peak FP32         : %.0f GFLOPS\n", peak_fp32_gflops);
-    printf("  Peak Mem BW       : %.0f GB/s (theoretical)\n", peak_bw_gbs);
-    printf("  cuBLAS            : via cublasSgemm / cublasGemmEx\n");
-    printf("  cuDNN             : %d.%d.%d\n",
-           CUDNN_MAJOR, CUDNN_MINOR, CUDNN_PATCHLEVEL);
-    printf("  Precision         : float32\n");
-    printf("  Notes             : Ratio = cuDeep / Ref (lower = cuDeep faster)\n");
-    printf("                    : GF column = GFLOPS for compute, GB/s for mem-bound\n");
+    printf("%s\n", std::string(104, '=').c_str());
+    printf("  %scuDeep vs cuBLAS + cuDNN  —  HEAD-TO-HEAD BENCHMARK%s\n", C_BOLD, C_RESET);
+    printf("%s\n", std::string(104, '=').c_str());
+    printf("  Device   : %s%s%s  (SM %d.%d, %d SMs @ %.0f MHz)\n",
+           C_CYAN, prop.name, C_RESET, prop.major, prop.minor,
+           prop.multiProcessorCount, prop.clockRate / 1e3f);
+    printf("  VRAM     : %zu MB   |   Peak FP32: %.0f GFLOPS   |   Peak BW: %.0f GB/s\n",
+           prop.totalGlobalMem >> 20, peak_fp32_gflops, peak_bw_gbs);
+    printf("  cuBLAS   : cublasSgemm / cublasGemmEx\n");
+    printf("  cuDNN    : %d.%d.%d\n", CUDNN_MAJOR, CUDNN_MINOR, CUDNN_PATCHLEVEL);
+    printf("  Format   : %s>>> FASTER%s = cuDeep wins,  %s<<< SLOWER%s = ref wins,  %s=== TIED%s = within 3%%\n",
+           C_GREEN, C_RESET, C_RED, C_RESET, C_YELLOW, C_RESET);
 
     CHECK_CUBLAS(cublasCreate(&g_cublas));
     CHECK_CUDNN(cudnnCreate(&g_cudnn));
 
     struct Section {
         const char* title;
+        const char* ref_lib;
         std::function<std::vector<BenchResult>()> fn;
     };
 
     Section sections[] = {
-        {"SGEMM (FP32) — cuDeep vs cuBLAS",          bench_gemm},
-        {"GEMM (TF32 Tensor Core) — cuDeep vs cuBLAS", bench_gemm_tf32},
-        {"Conv2d Forward — cuDeep vs cuDNN",          bench_conv2d},
-        {"Activations — cuDeep vs cuDNN",             bench_activations},
-        {"Pooling — cuDeep vs cuDNN",                 bench_pooling},
-        {"BatchNorm — cuDeep vs cuDNN",               bench_batchnorm},
-        {"Softmax — cuDeep vs cuDNN",                 bench_softmax},
-        {"Reductions — cuDeep vs cuBLAS",             bench_reductions},
+        {"SGEMM (FP32)",              "cuBLAS",  bench_gemm},
+        {"GEMM (TF32 Tensor Core)",   "cuBLAS TF32", bench_gemm_tf32},
+        {"Conv2d Forward",            "cuDNN",   bench_conv2d},
+        {"Activations",               "cuDNN",   bench_activations},
+        {"Pooling",                   "cuDNN",   bench_pooling},
+        {"BatchNorm",                 "cuDNN",   bench_batchnorm},
+        {"Softmax",                   "cuDNN",   bench_softmax},
+        {"Reductions",                "cuBLAS",  bench_reductions},
     };
 
-    int total = 0;
+    int total = 0, total_wins = 0, total_losses = 0, total_ties = 0;
     for (auto& s : sections) {
         try {
             auto results = s.fn();
-            print_section(s.title, results);
+            print_section(s.title, s.ref_lib, results);
+            for (auto& r : results) {
+                if (r.is_win())  total_wins++;
+                else if (r.is_loss()) total_losses++;
+                else total_ties++;
+            }
             total += (int)results.size();
         } catch (std::exception& e) {
             printf("\n  [ERROR] %s: %s\n", s.title, e.what());
         }
     }
 
-    printf("\n%s\n", std::string(90, '=').c_str());
-    printf("  Complete. %d benchmarks across %zu categories.\n",
-           total, sizeof(sections) / sizeof(sections[0]));
-    printf("%s\n\n", std::string(90, '=').c_str());
+    printf("\n%s\n", std::string(104, '=').c_str());
+    printf("  %sOVERALL RESULTS  —  %d benchmarks across %zu categories%s\n",
+           C_BOLD, total, sizeof(sections) / sizeof(sections[0]), C_RESET);
+    printf("%s\n", std::string(104, '-').c_str());
+    printf("\n");
+    printf("       %s%d WINS%s      cuDeep faster than NVIDIA reference\n",
+           C_GREEN, total_wins, C_RESET);
+    printf("       %s%d LOSSES%s    NVIDIA reference faster\n",
+           C_RED, total_losses, C_RESET);
+    printf("       %s%d TIES%s      Within 3%% of each other\n",
+           C_YELLOW, total_ties, C_RESET);
+    printf("\n");
+
+    double win_pct = total > 0 ? 100.0 * total_wins / total : 0;
+    if (win_pct >= 60)
+        printf("       %sWin rate: %.0f%%%s\n", C_GREEN, win_pct, C_RESET);
+    else if (win_pct >= 40)
+        printf("       %sWin rate: %.0f%%%s\n", C_YELLOW, win_pct, C_RESET);
+    else
+        printf("       %sWin rate: %.0f%%%s\n", C_RED, win_pct, C_RESET);
+
+    printf("\n%s\n\n", std::string(104, '=').c_str());
 
     CHECK_CUDNN(cudnnDestroy(g_cudnn));
     CHECK_CUBLAS(cublasDestroy(g_cublas));
