@@ -773,10 +773,15 @@ int main() {
     cudaDeviceProp prop;
     CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
 
+    int clock_khz = 0, mem_clock_khz = 0, mem_bus_width = 0;
+    cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, 0);
+    cudaDeviceGetAttribute(&mem_clock_khz, cudaDevAttrMemoryClockRate, 0);
+    cudaDeviceGetAttribute(&mem_bus_width, cudaDevAttrGlobalMemoryBusWidth, 0);
+
     float peak_fp32_gflops = (float)prop.multiProcessorCount * 128 * 2 *
-                             prop.clockRate / 1e6f;
-    float peak_bw_gbs = 2.0f * prop.memoryClockRate * 1e3f *
-                        (prop.memoryBusWidth / 8.0f) / 1e9f;
+                             clock_khz / 1e6f;
+    float peak_bw_gbs = 2.0f * mem_clock_khz * 1e3f *
+                        (mem_bus_width / 8.0f) / 1e9f;
 
     printf("\n");
     printf("%s\n", std::string(104, '=').c_str());
@@ -784,7 +789,7 @@ int main() {
     printf("%s\n", std::string(104, '=').c_str());
     printf("  Device   : %s%s%s  (SM %d.%d, %d SMs @ %.0f MHz)\n",
            C_CYAN, prop.name, C_RESET, prop.major, prop.minor,
-           prop.multiProcessorCount, prop.clockRate / 1e3f);
+           prop.multiProcessorCount, clock_khz / 1e3f);
     printf("  VRAM     : %zu MB   |   Peak FP32: %.0f GFLOPS   |   Peak BW: %.0f GB/s\n",
            prop.totalGlobalMem >> 20, peak_fp32_gflops, peak_bw_gbs);
     printf("  cuBLAS   : cublasSgemm / cublasGemmEx\n");

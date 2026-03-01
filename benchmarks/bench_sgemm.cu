@@ -91,10 +91,12 @@ static float bench_cublas(int M, int N, int K, int warmup, int iters) {
 int main() {
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, 0);
+    int clock_khz = 0;
+    cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, 0);
     float peak_tflops = (float)prop.multiProcessorCount * 128 * 2 *
-                        prop.clockRate / 1e6f;
+                        clock_khz / 1e6f;
     printf("Device: %s (%d SMs, %.0f MHz)\n", prop.name,
-           prop.multiProcessorCount, prop.clockRate / 1e3f);
+           prop.multiProcessorCount, clock_khz / 1e3f);
     printf("Theoretical FP32 peak: %.1f GFLOPS\n", peak_tflops);
     printf("Shared mem/SM: %zu KB\n\n", prop.sharedMemPerMultiprocessor / 1024);
 
