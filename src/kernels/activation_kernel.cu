@@ -1,4 +1,5 @@
 #include "cudeep/kernels/activation.cuh"
+#include "cudeep/ptx_intrinsics.cuh"
 #include "cudeep/error.cuh"
 
 #include <cmath>
@@ -7,15 +8,13 @@ namespace cudeep {
 namespace kernels {
 
 // ===========================================================================
-// Vectorized activation kernels — float4 loads/stores, grid-stride loop,
-// fast math intrinsics (__expf, etc.) for float path.
+// PTX-optimized activation kernels
 //
-// Previous version: scalar, one element per thread, switch in hot path.
-// New version: 4 elements per thread via float4, specialized per activation
-//   to eliminate branch in inner loop, fast math where possible.
+// Memory: ptx::ldg_nc_v4 (non-coherent streaming, bypasses L1)
+//         ptx::stg_v4    (vectorized global stores)
+// Math:   ptx::fast_*_ptx - guaranteed SFU instruction paths
+//         (ex2.approx, rcp.approx for sigmoid; tanh via 2*sigmoid-1)
 // ===========================================================================
-
-// ---- Device helpers (using hardware SFU where available) ----
 
 template <typename T>
 __device__ __forceinline__ T act_relu(T x) {
@@ -28,7 +27,7 @@ __device__ __forceinline__ T act_sigmoid(T x) {
 }
 template <>
 __device__ __forceinline__ float act_sigmoid<float>(float x) {
-    return fast_sigmoid(x);
+    return ptx::fast_sigmoid_ptx(x);
 }
 
 template <typename T>
@@ -37,7 +36,7 @@ __device__ __forceinline__ T act_tanh(T x) {
 }
 template <>
 __device__ __forceinline__ float act_tanh<float>(float x) {
-    return fast_tanh(x);
+    return ptx::fast_tanh_ptx(x);
 }
 
 template <typename T>
@@ -49,13 +48,16 @@ __device__ __forceinline__ T act_gelu(T x) {
 }
 template <>
 __device__ __forceinline__ float act_gelu<float>(float x) {
-    float inner = 0.7978845608f * (x + 0.044715f * x * x * x);
-    return 0.5f * x * (1.0f + fast_tanh(inner));
+    return ptx::fast_gelu_ptx(x);
 }
 
 template <typename T>
 __device__ __forceinline__ T act_silu(T x) {
     return x * act_sigmoid(x);
+}
+template <>
+__device__ __forceinline__ float act_silu<float>(float x) {
+    return ptx::fast_silu_ptx(x);
 }
 
 template <typename T>
@@ -63,8 +65,7 @@ __device__ __forceinline__ T act_leaky_relu(T x, T alpha) {
     return x > T(0) ? x : alpha * x;
 }
 
-// ---- Vectorized forward kernel (float specialization) ----
-// Processes 4 elements per thread using float4 loads/stores.
+// ---- Vectorized forward kernel (float) ----
 
 template <typename ActFn>
 __global__ void activation_fwd_vec4_kernel(
@@ -77,15 +78,12 @@ __global__ void activation_fwd_vec4_kernel(
     for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
          i < vec_n;
          i += blockDim.x * gridDim.x) {
-        float4 v = *reinterpret_cast<const float4*>(input + i * VW);
-        v.x = fn(v.x);
-        v.y = fn(v.y);
-        v.z = fn(v.z);
-        v.w = fn(v.w);
-        *reinterpret_cast<float4*>(output + i * VW) = v;
+        float4 v = ptx::ldg_nc_v4(input + i * VW);
+        v.x = fn(v.x); v.y = fn(v.y);
+        v.z = fn(v.z); v.w = fn(v.w);
+        ptx::stg_v4(output + i * VW, v);
     }
 
-    // Tail elements
     int64_t tail_start = vec_n * VW;
     for (int64_t i = tail_start + threadIdx.x + blockIdx.x * blockDim.x;
          i < n;
@@ -94,7 +92,7 @@ __global__ void activation_fwd_vec4_kernel(
     }
 }
 
-// ---- Vectorized backward kernel (float specialization) ----
+// ---- Vectorized backward kernel (float) ----
 
 template <typename BwdFn>
 __global__ void activation_bwd_vec4_kernel(
@@ -109,14 +107,12 @@ __global__ void activation_bwd_vec4_kernel(
     for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
          i < vec_n;
          i += blockDim.x * gridDim.x) {
-        float4 go = *reinterpret_cast<const float4*>(grad_output + i * VW);
-        float4 x  = *reinterpret_cast<const float4*>(input + i * VW);
+        float4 go = ptx::ldg_nc_v4(grad_output + i * VW);
+        float4 x  = ptx::ldg_nc_v4(input + i * VW);
         float4 gi;
-        gi.x = fn(go.x, x.x);
-        gi.y = fn(go.y, x.y);
-        gi.z = fn(go.z, x.z);
-        gi.w = fn(go.w, x.w);
-        *reinterpret_cast<float4*>(grad_input + i * VW) = gi;
+        gi.x = fn(go.x, x.x); gi.y = fn(go.y, x.y);
+        gi.z = fn(go.z, x.z); gi.w = fn(go.w, x.w);
+        ptx::stg_v4(grad_input + i * VW, gi);
     }
 
     int64_t tail_start = vec_n * VW;
@@ -202,7 +198,7 @@ __global__ void activation_backward_scalar_kernel(
 // ---- Launch wrappers ----
 
 static int grid_blocks(int64_t n, int threads) {
-    int64_t work = (n + 3) / 4;  // at least 1 if n > 0
+    int64_t work = (n + 3) / 4;
     int blocks = static_cast<int>((work + threads - 1) / threads);
     return max(min(blocks, 1024), 1);
 }
@@ -277,7 +273,7 @@ void launch_activation_backward_kernel<float>(
             activation_bwd_vec4_kernel<<<blocks, threads, 0, stream>>>(
                 grad_output, input, grad_input, n,
                 [] __device__ (float go, float x) -> float {
-                    float s = fast_sigmoid(x);
+                    float s = ptx::fast_sigmoid_ptx(x);
                     return go * s * (1.0f - s);
                 });
             break;
@@ -285,7 +281,7 @@ void launch_activation_backward_kernel<float>(
             activation_bwd_vec4_kernel<<<blocks, threads, 0, stream>>>(
                 grad_output, input, grad_input, n,
                 [] __device__ (float go, float x) -> float {
-                    float t = fast_tanh(x);
+                    float t = ptx::fast_tanh_ptx(x);
                     return go * (1.0f - t * t);
                 });
             break;
@@ -295,7 +291,7 @@ void launch_activation_backward_kernel<float>(
                 [] __device__ (float go, float x) -> float {
                     float x3 = x * x * x;
                     float inner = 0.7978845608f * (x + 0.044715f * x3);
-                    float th = fast_tanh(inner);
+                    float th = ptx::fast_tanh_ptx(inner);
                     float sech2 = 1.0f - th * th;
                     float d_inner = 0.7978845608f * (1.0f + 3.0f * 0.044715f * x * x);
                     return go * (0.5f * (1.0f + th) + 0.5f * x * sech2 * d_inner);
@@ -305,7 +301,7 @@ void launch_activation_backward_kernel<float>(
             activation_bwd_vec4_kernel<<<blocks, threads, 0, stream>>>(
                 grad_output, input, grad_input, n,
                 [] __device__ (float go, float x) -> float {
-                    float s = fast_sigmoid(x);
+                    float s = ptx::fast_sigmoid_ptx(x);
                     return go * (s * (1.0f + x * (1.0f - s)));
                 });
             break;

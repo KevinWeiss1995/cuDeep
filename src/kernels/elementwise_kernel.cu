@@ -1,4 +1,5 @@
 #include "cudeep/kernels/elementwise.cuh"
+#include "cudeep/ptx_intrinsics.cuh"
 #include "cudeep/error.cuh"
 
 namespace cudeep {

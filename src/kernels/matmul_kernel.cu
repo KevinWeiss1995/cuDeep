@@ -1,71 +1,212 @@
 #include "cudeep/kernels/matmul.cuh"
+#include "cudeep/ptx_intrinsics.cuh"
 #include "cudeep/error.cuh"
 
 namespace cudeep {
 namespace kernels {
 
 // ===========================================================================
-// SGEMM v4 — instruction-issue-rate optimised
+//  SGEMM kernel suite — three paths in descending priority:
 //
-// The v3 kernel's bottleneck was NOT occupancy (2 blocks/SM with 124 regs,
-// 17 KB smem out of 164 KB available). It was **FMA dilution**: 16 scalar
-// shared-memory loads per k-step drowned the 64 FMAs (80% FMA ratio). With
-// warp scheduler overheads the effective FMA utilisation dropped to ~30%.
+//    1. TF32 Tensor Core  (SM 8.0+, aligned dims, ~2x throughput of FP32)
+//    2. FP32 CUDA Core    (any SM, fast path for aligned dims)
+//    3. FP32 CUDA Core    (any SM, general path with boundary checks)
 //
-// Fixes applied:
-//   1. float4 smem reads — 2 loads per fragment instead of 8 → 94% FMA ratio
-//   2. BK=16 — halves tile count, halves __syncthreads / global-load phases
-//   3. cp.async for B — global→shared without register detour (SM 8.0+)
-//   4. Fully unrolled k-loop — zero loop overhead
-//   5. Fast path skips all boundary checks for aligned matrices
+//  All share the same tile/smem layout so the loading code is identical.
 // ===========================================================================
 
+// ---- Shared tile parameters ----
 constexpr int BM = 128;
 constexpr int BN = 128;
 constexpr int BK = 16;
-constexpr int TM = 8;
-constexpr int TN = 8;
 constexpr int NUM_THREADS = 256;
-constexpr int SMEM_A_STRIDE = BM + 4;   // 132 — avoids bank conflicts on A reads
+constexpr int SMEM_A_STRIDE = BM + 4;   // 132
 constexpr int SMEM_B_STRIDE = BN + 4;   // 132
 
-// A: 128×16 = 2048 elems, 256 threads → 8 scalar loads/thread
-// B: 16×128 = 2048 elems = 512 float4s, 256 threads → 2 float4 loads/thread
+// ---- FP32 CUDA-core parameters ----
+constexpr int TM = 8;
+constexpr int TN = 8;
 
-// Shared memory per buffer:
-//   As: 16 × 132 × 4 = 8448  bytes
-//   Bs: 16 × 132 × 4 = 8448  bytes
-//   Total per buffer: 16896 bytes
-//   Double-buffered: 33792 bytes ≈ 33 KB — fits 2 blocks in 164 KB/SM
+// ---- TC (Tensor Core) parameters ----
+constexpr int TC_WM = 32;                       // warp tile M
+constexpr int TC_WN = 64;                       // warp tile N
+constexpr int TC_WARPS_M = BM / TC_WM;          // 4
+constexpr int TC_WARPS_N = BN / TC_WN;          // 2
+constexpr int MMA_M = 16, MMA_N = 8, MMA_K = 8;
+constexpr int MMA_TILES_M = TC_WM / MMA_M;      // 2
+constexpr int MMA_TILES_N = TC_WN / MMA_N;      // 8
 
-// ---- Inline helpers for cp.async (B loads) ----
+// ---- Tile loading params (common to all float kernels) ----
+// A: 128×16 = 2048 elems, 256 threads, 8 scalar loads/thread
+// B: 16×128 = 2048 elems = 512 float4s, 256 threads, 2 float4/thread
 
-__device__ __forceinline__ void cp_async_f4_or_direct(
-    float* smem_dst, const float* global_src) {
-#if __CUDA_ARCH__ >= 800
-    uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
-    asm volatile(
-        "cp.async.cg.shared.global [%0], [%1], 16;\n"
-        :: "r"(smem_addr), "l"(global_src) : "memory");
-#else
-    *reinterpret_cast<float4*>(smem_dst) =
-        *reinterpret_cast<const float4*>(global_src);
-#endif
+// ===========================================================================
+//  Path 1: TF32 Tensor Core SGEMM  (SM 8.0+, aligned dims)
+//
+//  Each warp computes a 32×64 output tile using mma.sync.m16n8k8.
+//  8 warps (256 threads) in a 4×2 grid cover the 128×128 block tile.
+//  Per k=8 step: 2 M-tiles × 8 N-tiles = 16 MMA calls per warp.
+//  Per BK=16 tile: 32 MMA calls per warp.
+//  Accumulators: 2×8×4 = 64 registers per thread.
+//
+//  Fragment mapping (mma.sync.m16n8k8.row.col.f32.tf32.tf32.f32):
+//    lane = threadIdx.x % 32
+//    gid  = lane / 4            (0..7)
+//    tg   = lane % 4            (0..3)
+//
+//    A[m][k] row-major, stored transposed as As[k][m]:
+//      a0 = As[kk + tg*2    ][m_base + gid    ]
+//      a1 = As[kk + tg*2 + 1][m_base + gid    ]
+//      a2 = As[kk + tg*2    ][m_base + gid + 8]
+//      a3 = As[kk + tg*2 + 1][m_base + gid + 8]
+//
+//    B[k][n] col-major descriptor, stored as Bs[k][n]:
+//      b0 = Bs[kk + tg*2    ][n_base + gid]
+//      b1 = Bs[kk + tg*2 + 1][n_base + gid]
+//
+//    D[m][n] output:
+//      d0 = C[m_base + gid    ][n_base + tg*2    ]
+//      d1 = C[m_base + gid    ][n_base + tg*2 + 1]
+//      d2 = C[m_base + gid + 8][n_base + tg*2    ]
+//      d3 = C[m_base + gid + 8][n_base + tg*2 + 1]
+// ===========================================================================
+
+__global__ __launch_bounds__(NUM_THREADS, 2)
+void sgemm_tc_kernel(const float* __restrict__ A,
+                     const float* __restrict__ B,
+                     float* __restrict__ C,
+                     int M, int N, int K) {
+
+    __shared__ float As[2][BK][SMEM_A_STRIDE];
+    __shared__ float Bs[2][BK][SMEM_B_STRIDE];
+
+    const int bm = blockIdx.y * BM;
+    const int bn = blockIdx.x * BN;
+    const int tid = threadIdx.x;
+
+    // Warp / lane decomposition
+    const int warp_id = tid / 32;
+    const int lane = tid % 32;
+    const int warp_m = warp_id / TC_WARPS_N;
+    const int warp_n = warp_id % TC_WARPS_N;
+    const int gid = lane / 4;
+    const int tg  = lane % 4;
+
+    // Accumulators
+    float acc[MMA_TILES_M][MMA_TILES_N][4];
+    #pragma unroll
+    for (int mi = 0; mi < MMA_TILES_M; ++mi)
+        #pragma unroll
+        for (int ni = 0; ni < MMA_TILES_N; ++ni) {
+            acc[mi][ni][0] = 0.f; acc[mi][ni][1] = 0.f;
+            acc[mi][ni][2] = 0.f; acc[mi][ni][3] = 0.f;
+        }
+
+    // A load mapping — scalar, column-major for perfect global coalescing
+    const int a_col = tid % BK;
+    const int a_row0 = tid / BK;
+
+    // B load mapping — 2 float4 per thread via cp.async
+    const int b_row0 = tid / 32;
+    const int b_col4 = tid % 32;
+    const int b_row1 = 8 + b_row0;
+
+    // ---- Tile loaders ----
+    #define LOAD_A(buf, bk_off) do {                                         \
+        const float* _Ab = A + bm * K + (bk_off) + a_col;                   \
+        _Pragma("unroll")                                                     \
+        for (int _s = 0; _s < 8; ++_s)                                      \
+            As[buf][a_col][a_row0 + _s * 16] = _Ab[(a_row0 + _s * 16) * K]; \
+    } while(0)
+
+    #define LOAD_B(buf, bk_off) do {                                         \
+        ptx::cp_async_cg_16(                                                  \
+            &Bs[buf][b_row0][b_col4 * 4],                                    \
+            &B[((bk_off) + b_row0) * N + bn + b_col4 * 4]);                 \
+        ptx::cp_async_cg_16(                                                  \
+            &Bs[buf][b_row1][b_col4 * 4],                                    \
+            &B[((bk_off) + b_row1) * N + bn + b_col4 * 4]);                 \
+    } while(0)
+
+    // ---- MMA compute macro ----
+    #define TC_COMPUTE(buf) do {                                             \
+        _Pragma("unroll")                                                     \
+        for (int _kk = 0; _kk < BK; _kk += MMA_K) {                        \
+            _Pragma("unroll")                                                 \
+            for (int _mi = 0; _mi < MMA_TILES_M; ++_mi) {                   \
+                int _am = warp_m * TC_WM + _mi * MMA_M;                     \
+                uint32_t _a0 = __float_as_uint(                              \
+                    As[buf][_kk + tg*2    ][_am + gid    ]);                 \
+                uint32_t _a1 = __float_as_uint(                              \
+                    As[buf][_kk + tg*2    ][_am + gid + 8]);                \
+                uint32_t _a2 = __float_as_uint(                              \
+                    As[buf][_kk + tg*2 + 1][_am + gid    ]);                \
+                uint32_t _a3 = __float_as_uint(                              \
+                    As[buf][_kk + tg*2 + 1][_am + gid + 8]);                \
+                _Pragma("unroll")                                             \
+                for (int _ni = 0; _ni < MMA_TILES_N; ++_ni) {               \
+                    int _bn = warp_n * TC_WN + _ni * MMA_N;                 \
+                    uint32_t _b0 = __float_as_uint(                          \
+                        Bs[buf][_kk + tg*2    ][_bn + gid]);                \
+                    uint32_t _b1 = __float_as_uint(                          \
+                        Bs[buf][_kk + tg*2 + 1][_bn + gid]);               \
+                    ptx::mma_m16n8k8_tf32(                                   \
+                        acc[_mi][_ni][0], acc[_mi][_ni][1],                  \
+                        acc[_mi][_ni][2], acc[_mi][_ni][3],                  \
+                        _a0, _a1, _a2, _a3, _b0, _b1,                       \
+                        acc[_mi][_ni][0], acc[_mi][_ni][1],                  \
+                        acc[_mi][_ni][2], acc[_mi][_ni][3]);                 \
+                }                                                             \
+            }                                                                 \
+        }                                                                     \
+    } while(0)
+
+    // ---- Main loop with double buffering ----
+    LOAD_A(0, 0);
+    LOAD_B(0, 0);
+    ptx::cp_async_commit();
+    ptx::cp_async_wait_all();
+    __syncthreads();
+
+    const int num_tiles = K / BK;
+    int buf = 0;
+
+    for (int t = 0; t < num_tiles - 1; ++t) {
+        LOAD_A(1 - buf, (t + 1) * BK);
+        LOAD_B(1 - buf, (t + 1) * BK);
+        ptx::cp_async_commit();
+
+        TC_COMPUTE(buf);
+
+        ptx::cp_async_wait_all();
+        buf = 1 - buf;
+        __syncthreads();
+    }
+    TC_COMPUTE(buf);
+
+    #undef LOAD_A
+    #undef LOAD_B
+    #undef TC_COMPUTE
+
+    // ---- Store C (float2 per output position) ----
+    #pragma unroll
+    for (int mi = 0; mi < MMA_TILES_M; ++mi) {
+        int row0 = bm + warp_m * TC_WM + mi * MMA_M + gid;
+        int row1 = row0 + 8;
+        #pragma unroll
+        for (int ni = 0; ni < MMA_TILES_N; ++ni) {
+            int col = bn + warp_n * TC_WN + ni * MMA_N + tg * 2;
+            *reinterpret_cast<float2*>(&C[row0 * N + col]) =
+                make_float2(acc[mi][ni][0], acc[mi][ni][1]);
+            *reinterpret_cast<float2*>(&C[row1 * N + col]) =
+                make_float2(acc[mi][ni][2], acc[mi][ni][3]);
+        }
+    }
 }
 
-__device__ __forceinline__ void cp_async_fence() {
-#if __CUDA_ARCH__ >= 800
-    asm volatile("cp.async.commit_group;\n" ::: "memory");
-#endif
-}
-
-__device__ __forceinline__ void cp_async_wait() {
-#if __CUDA_ARCH__ >= 800
-    asm volatile("cp.async.wait_all;\n" ::: "memory");
-#endif
-}
-
-// ---- Fast-path: M%BM==0, N%BN==0, K%BK==0, N%4==0 ----
+// ===========================================================================
+//  Path 2: FP32 CUDA Core — fast path (aligned dims, no boundary checks)
+// ===========================================================================
 
 __global__ __launch_bounds__(NUM_THREADS, 2)
 void sgemm_fast_kernel(const float* __restrict__ A,
@@ -78,102 +219,83 @@ void sgemm_fast_kernel(const float* __restrict__ A,
 
     const int bm = blockIdx.y * BM;
     const int bn = blockIdx.x * BN;
-    const int tx = threadIdx.x % (BN / TN);     // 0..15
-    const int ty = threadIdx.x / (BN / TN);     // 0..15
+    const int tx = threadIdx.x % (BN / TN);
+    const int ty = threadIdx.x / (BN / TN);
     const int tid = threadIdx.x;
-    const int a_base = ty * TM;                  // always multiple of 8
-    const int b_base = tx * TN;                  // always multiple of 8
+    const int a_base = ty * TM;
+    const int b_base = tx * TN;
 
-    // A load mapping — scalar, column-major for perfect coalescing
-    const int a_col = tid % BK;                  // 0..15
-    const int a_row0 = tid / BK;                 // 0..15
-    // 8 loads per thread at a_row0 + i*16 for i=0..7
-
-    // B load mapping — 2 float4s per thread
-    const int b_f4_id0 = tid;                    // 0..255
-    const int b_row0 = b_f4_id0 / (BN / 4);     // tid / 32
-    const int b_col4_0 = b_f4_id0 % (BN / 4);   // tid % 32
-    const int b_f4_id1 = tid + NUM_THREADS;      // 256..511
-    const int b_row1 = b_f4_id1 / (BN / 4);     // 8 + tid/32
-    const int b_col4_1 = b_f4_id1 % (BN / 4);   // tid % 32
+    const int a_col = tid % BK;
+    const int a_row0 = tid / BK;
+    const int b_row0 = tid / 32;
+    const int b_col4 = tid % 32;
+    const int b_row1 = 8 + b_row0;
 
     float acc[TM][TN] = {};
 
-    // ---- Tile loading macros ----
-    #define LOAD_A_TILE(buf, bk_off) do {                                   \
-        const float* _Ab = A + bm * K + (bk_off) + a_col;                  \
-        _Pragma("unroll")                                                    \
-        for (int _s = 0; _s < 8; ++_s)                                     \
+    #define LOAD_A(buf, bk_off) do {                                         \
+        const float* _Ab = A + bm * K + (bk_off) + a_col;                   \
+        _Pragma("unroll")                                                     \
+        for (int _s = 0; _s < 8; ++_s)                                      \
             As[buf][a_col][a_row0 + _s * 16] = _Ab[(a_row0 + _s * 16) * K]; \
     } while(0)
 
-    #define LOAD_B_TILE(buf, bk_off) do {                                   \
-        cp_async_f4_or_direct(                                               \
-            &Bs[buf][b_row0][b_col4_0 * 4],                                 \
-            &B[((bk_off) + b_row0) * N + bn + b_col4_0 * 4]);              \
-        cp_async_f4_or_direct(                                               \
-            &Bs[buf][b_row1][b_col4_1 * 4],                                 \
-            &B[((bk_off) + b_row1) * N + bn + b_col4_1 * 4]);              \
+    #define LOAD_B_FAST(buf, bk_off) do {                                    \
+        ptx::cp_async_cg_16(                                                  \
+            &Bs[buf][b_row0][b_col4 * 4],                                    \
+            &B[((bk_off) + b_row0) * N + bn + b_col4 * 4]);                 \
+        ptx::cp_async_cg_16(                                                  \
+            &Bs[buf][b_row1][b_col4 * 4],                                    \
+            &B[((bk_off) + b_row1) * N + bn + b_col4 * 4]);                 \
     } while(0)
 
-    // Compute one tile with float4 smem reads — 4 loads + 64 FMAs per k-step
-    #define COMPUTE_TILE(buf) do {                                          \
-        float4 _a4_lo, _a4_hi, _b4_lo, _b4_hi;                            \
-        float _af[TM], _bf[TN];                                            \
-        _Pragma("unroll")                                                    \
-        for (int _k = 0; _k < BK; ++_k) {                                 \
-            _a4_lo = *reinterpret_cast<const float4*>(                      \
-                         &As[buf][_k][a_base]);                             \
-            _a4_hi = *reinterpret_cast<const float4*>(                      \
-                         &As[buf][_k][a_base + 4]);                         \
-            _af[0] = _a4_lo.x; _af[1] = _a4_lo.y;                         \
-            _af[2] = _a4_lo.z; _af[3] = _a4_lo.w;                         \
-            _af[4] = _a4_hi.x; _af[5] = _a4_hi.y;                         \
-            _af[6] = _a4_hi.z; _af[7] = _a4_hi.w;                         \
-            _b4_lo = *reinterpret_cast<const float4*>(                      \
-                         &Bs[buf][_k][b_base]);                             \
-            _b4_hi = *reinterpret_cast<const float4*>(                      \
-                         &Bs[buf][_k][b_base + 4]);                         \
-            _bf[0] = _b4_lo.x; _bf[1] = _b4_lo.y;                         \
-            _bf[2] = _b4_lo.z; _bf[3] = _b4_lo.w;                         \
-            _bf[4] = _b4_hi.x; _bf[5] = _b4_hi.y;                         \
-            _bf[6] = _b4_hi.z; _bf[7] = _b4_hi.w;                         \
-            _Pragma("unroll")                                                \
-            for (int _m = 0; _m < TM; ++_m)                                \
-                _Pragma("unroll")                                            \
-                for (int _n = 0; _n < TN; ++_n)                            \
-                    acc[_m][_n] += _af[_m] * _bf[_n];                       \
-        }                                                                    \
+    #define COMPUTE(buf) do {                                                \
+        _Pragma("unroll")                                                     \
+        for (int _k = 0; _k < BK; ++_k) {                                   \
+            float4 _a4lo = *reinterpret_cast<const float4*>(                 \
+                               &As[buf][_k][a_base]);                        \
+            float4 _a4hi = *reinterpret_cast<const float4*>(                 \
+                               &As[buf][_k][a_base + 4]);                   \
+            float4 _b4lo = *reinterpret_cast<const float4*>(                 \
+                               &Bs[buf][_k][b_base]);                        \
+            float4 _b4hi = *reinterpret_cast<const float4*>(                 \
+                               &Bs[buf][_k][b_base + 4]);                   \
+            float _af[TM] = {_a4lo.x, _a4lo.y, _a4lo.z, _a4lo.w,          \
+                             _a4hi.x, _a4hi.y, _a4hi.z, _a4hi.w};          \
+            float _bf[TN] = {_b4lo.x, _b4lo.y, _b4lo.z, _b4lo.w,          \
+                             _b4hi.x, _b4hi.y, _b4hi.z, _b4hi.w};          \
+            _Pragma("unroll")                                                 \
+            for (int _m = 0; _m < TM; ++_m)                                 \
+                _Pragma("unroll")                                             \
+                for (int _n = 0; _n < TN; ++_n)                             \
+                    acc[_m][_n] += _af[_m] * _bf[_n];                        \
+        }                                                                     \
     } while(0)
 
-    // ---- Main loop with double buffering ----
-    LOAD_A_TILE(0, 0);
-    LOAD_B_TILE(0, 0);
-    cp_async_fence();
-    cp_async_wait();
+    LOAD_A(0, 0);
+    LOAD_B_FAST(0, 0);
+    ptx::cp_async_commit();
+    ptx::cp_async_wait_all();
     __syncthreads();
 
     const int num_tiles = K / BK;
     int buf = 0;
 
     for (int t = 0; t < num_tiles - 1; ++t) {
-        LOAD_A_TILE(1 - buf, (t + 1) * BK);
-        LOAD_B_TILE(1 - buf, (t + 1) * BK);
-        cp_async_fence();
-
-        COMPUTE_TILE(buf);
-
-        cp_async_wait();
+        LOAD_A(1 - buf, (t + 1) * BK);
+        LOAD_B_FAST(1 - buf, (t + 1) * BK);
+        ptx::cp_async_commit();
+        COMPUTE(buf);
+        ptx::cp_async_wait_all();
         buf = 1 - buf;
         __syncthreads();
     }
-    COMPUTE_TILE(buf);
+    COMPUTE(buf);
 
-    #undef LOAD_A_TILE
-    #undef LOAD_B_TILE
-    #undef COMPUTE_TILE
+    #undef LOAD_A
+    #undef LOAD_B_FAST
+    #undef COMPUTE
 
-    // Vectorised store (guaranteed aligned in fast path)
     float* Crow = C + (bm + a_base) * N + bn + b_base;
     #pragma unroll
     for (int m = 0; m < TM; ++m) {
@@ -183,7 +305,9 @@ void sgemm_fast_kernel(const float* __restrict__ A,
     }
 }
 
-// ---- General kernel: handles arbitrary M, N, K ----
+// ===========================================================================
+//  Path 3: FP32 CUDA Core — general (handles any M, N, K)
+// ===========================================================================
 
 __global__ __launch_bounds__(NUM_THREADS, 2)
 void sgemm_general_kernel(const float* __restrict__ A,
@@ -204,12 +328,9 @@ void sgemm_general_kernel(const float* __restrict__ A,
 
     const int a_col = tid % BK;
     const int a_row0 = tid / BK;
-    const int b_f4_id0 = tid;
-    const int b_row0 = b_f4_id0 / (BN / 4);
-    const int b_col4_0 = b_f4_id0 % (BN / 4);
-    const int b_f4_id1 = tid + NUM_THREADS;
-    const int b_row1 = b_f4_id1 / (BN / 4);
-    const int b_col4_1 = b_f4_id1 % (BN / 4);
+    const int b_row0 = tid / 32;
+    const int b_col4 = tid % 32;
+    const int b_row1 = 8 + b_row0;
 
     float acc[TM][TN] = {};
 
@@ -224,52 +345,30 @@ void sgemm_general_kernel(const float* __restrict__ A,
     };
 
     auto load_B_safe = [&](int buf_idx, int bk) {
-        // Load 0
-        {
-            int gr = bk + b_row0;
-            int gc = bn + b_col4_0 * 4;
+        auto do_one = [&](int br, int bc4) {
+            int gr = bk + br;
+            int gc = bn + bc4 * 4;
             if (gr < K && gc + 3 < N) {
                 int addr = gr * N + gc;
                 if ((addr & 3) == 0) {
-                    *reinterpret_cast<float4*>(&Bs[buf_idx][b_row0][b_col4_0 * 4]) =
+                    *reinterpret_cast<float4*>(&Bs[buf_idx][br][bc4 * 4]) =
                         *reinterpret_cast<const float4*>(&B[addr]);
                 } else {
-                    Bs[buf_idx][b_row0][b_col4_0*4+0] = B[addr+0];
-                    Bs[buf_idx][b_row0][b_col4_0*4+1] = B[addr+1];
-                    Bs[buf_idx][b_row0][b_col4_0*4+2] = B[addr+2];
-                    Bs[buf_idx][b_row0][b_col4_0*4+3] = B[addr+3];
+                    Bs[buf_idx][br][bc4*4+0] = B[addr+0];
+                    Bs[buf_idx][br][bc4*4+1] = B[addr+1];
+                    Bs[buf_idx][br][bc4*4+2] = B[addr+2];
+                    Bs[buf_idx][br][bc4*4+3] = B[addr+3];
                 }
             } else {
                 for (int j = 0; j < 4; ++j) {
                     int c = gc + j;
-                    Bs[buf_idx][b_row0][b_col4_0*4+j] =
+                    Bs[buf_idx][br][bc4*4+j] =
                         (gr < K && c < N) ? B[gr * N + c] : 0.0f;
                 }
             }
-        }
-        // Load 1
-        {
-            int gr = bk + b_row1;
-            int gc = bn + b_col4_1 * 4;
-            if (gr < K && gc + 3 < N) {
-                int addr = gr * N + gc;
-                if ((addr & 3) == 0) {
-                    *reinterpret_cast<float4*>(&Bs[buf_idx][b_row1][b_col4_1 * 4]) =
-                        *reinterpret_cast<const float4*>(&B[addr]);
-                } else {
-                    Bs[buf_idx][b_row1][b_col4_1*4+0] = B[addr+0];
-                    Bs[buf_idx][b_row1][b_col4_1*4+1] = B[addr+1];
-                    Bs[buf_idx][b_row1][b_col4_1*4+2] = B[addr+2];
-                    Bs[buf_idx][b_row1][b_col4_1*4+3] = B[addr+3];
-                }
-            } else {
-                for (int j = 0; j < 4; ++j) {
-                    int c = gc + j;
-                    Bs[buf_idx][b_row1][b_col4_1*4+j] =
-                        (gr < K && c < N) ? B[gr * N + c] : 0.0f;
-                }
-            }
-        }
+        };
+        do_one(b_row0, b_col4);
+        do_one(b_row1, b_col4);
     };
 
     load_A_safe(0, 0);
@@ -283,7 +382,6 @@ void sgemm_general_kernel(const float* __restrict__ A,
         load_A_safe(1 - buf, (t + 1) * BK);
         load_B_safe(1 - buf, (t + 1) * BK);
 
-        // Compute with float4 smem reads
         #pragma unroll
         for (int k = 0; k < BK; ++k) {
             float4 a4lo = *reinterpret_cast<const float4*>(&As[buf][k][a_base]);
@@ -305,7 +403,6 @@ void sgemm_general_kernel(const float* __restrict__ A,
         __syncthreads();
     }
 
-    // Last tile
     #pragma unroll
     for (int k = 0; k < BK; ++k) {
         float4 a4lo = *reinterpret_cast<const float4*>(&As[buf][k][a_base]);
@@ -323,7 +420,6 @@ void sgemm_general_kernel(const float* __restrict__ A,
                 acc[m][n] += af[m] * bf[n];
     }
 
-    // Store
     const int c_row = bm + a_base;
     const int c_col = bn + b_base;
     #pragma unroll
@@ -346,7 +442,7 @@ void sgemm_general_kernel(const float* __restrict__ A,
 }
 
 // ===========================================================================
-// Double-precision fallback (single-buffered, smaller tiles)
+//  Double-precision fallback (single-buffered, smaller tiles)
 // ===========================================================================
 
 constexpr int BM_D = 64, BN_D = 64, BK_D = 16, TM_D = 4, TN_D = 4;
@@ -400,15 +496,30 @@ void sgemm_double_kernel(const T* __restrict__ A, const T* __restrict__ B,
 }
 
 // ===========================================================================
-// Launch wrappers
+//  Launch dispatcher
 // ===========================================================================
+
+// Runtime TC check — the __CUDA_ARCH__ guard is for device code only,
+// so we need a host-side capability check.
+static bool has_tensor_cores() {
+    static int cached = -1;
+    if (cached < 0) {
+        int major = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0);
+        cached = (major >= 8) ? 1 : 0;
+    }
+    return cached == 1;
+}
 
 template <>
 void launch_matmul_kernel<float>(const float* A, const float* B, float* C,
                                   int M, int N, int K, cudaStream_t stream) {
     dim3 blocks(ceil_div(N, BN), ceil_div(M, BM));
-    bool fast = (M % BM == 0) && (N % BN == 0) && (K % BK == 0) && (N % 4 == 0);
-    if (fast) {
+    bool aligned = (M % BM == 0) && (N % BN == 0) && (K % BK == 0);
+
+    if (aligned && has_tensor_cores()) {
+        sgemm_tc_kernel<<<blocks, NUM_THREADS, 0, stream>>>(A, B, C, M, N, K);
+    } else if (aligned && (N % 4 == 0)) {
         sgemm_fast_kernel<<<blocks, NUM_THREADS, 0, stream>>>(A, B, C, M, N, K);
     } else {
         sgemm_general_kernel<<<blocks, NUM_THREADS, 0, stream>>>(A, B, C, M, N, K);

@@ -1,4 +1,5 @@
 #include "cudeep/kernels/optim.cuh"
+#include "cudeep/ptx_intrinsics.cuh"
 #include "cudeep/error.cuh"
 
 #include <cmath>
