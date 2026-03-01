@@ -6,12 +6,26 @@ build-backend = "setuptools.build_meta"
 name = "cuDeep"
 version = "0.1.0"
 description = "Ultra-high performance deep learning library implemented in CUDA"
+readme = "README.md"
 requires-python = ">=3.9"
-license = {text = "MIT"}
+license = "MIT"
+authors = [{name = "Kevin"}]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C++",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = ["numpy>=1.21"]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "black", "sphinx"]
+
+[project.urls]
+Homepage = "https://github.com/username/cuDeep"
+
+[tool.setuptools.packages.find]
+where = ["python"]
 
 [tool.black]
 line-length = 100

@@ -8,12 +8,11 @@ Usage:
     python setup.py bdist_wheel
 """
 
-import os
 import subprocess
 import sys
 from pathlib import Path
 
-from setuptools import setup, find_packages, Extension
+from setuptools import setup, Extension
 from setuptools.command.build_ext import build_ext
 
 
@@ -36,7 +35,7 @@ class CMakeBuild(build_ext):
             "-DCUDEEP_BUILD_PYTHON=ON",
             "-DCUDEEP_BUILD_TESTS=OFF",
             "-DCUDEEP_BUILD_BENCHMARKS=OFF",
-            f"-DCMAKE_BUILD_TYPE=Release",
+            "-DCMAKE_BUILD_TYPE=Release",
         ]
 
         build_args = ["--config", "Release", "-j"]
@@ -52,34 +51,6 @@ class CMakeBuild(build_ext):
 
 
 setup(
-    name="cuDeep",
-    version="0.1.0",
-    author="Kevin",
-    description="Ultra-high performance deep learning library implemented in CUDA",
-    long_description=open("README.md").read(),
-    long_description_content_type="text/markdown",
-    url="https://github.com/username/cuDeep",
-    license="MIT",
-    packages=find_packages(where="python"),
-    package_dir={"": "python"},
     ext_modules=[CMakeExtension("_cudeep_core")],
     cmdclass={"build_ext": CMakeBuild},
-    python_requires=">=3.9",
-    install_requires=[
-        "numpy>=1.21",
-    ],
-    extras_require={
-        "dev": [
-            "pytest>=7.0",
-            "black",
-            "sphinx",
-        ],
-    },
-    classifiers=[
-        "Development Status :: 2 - Pre-Alpha",
-        "Programming Language :: Python :: 3",
-        "Programming Language :: C++",
-        "Topic :: Scientific/Engineering :: Artificial Intelligence",
-        "License :: OSI Approved :: MIT License",
-    ],
 )
