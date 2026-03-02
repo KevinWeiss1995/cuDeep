@@ -728,6 +728,26 @@ void launch_matmul_kernel<double>(const double* A, const double* B, double* C,
     CUDEEP_CHECK_LAST_KERNEL();
 }
 
+template <>
+void launch_matmul_kernel_fp32<float>(const float* A, const float* B, float* C,
+                                       int M, int N, int K, cudaStream_t stream) {
+    dim3 blocks(ceil_div(N, BN), ceil_div(M, BM));
+    bool aligned = (M % BM == 0) && (N % BN == 0) && (K % BK == 0);
+
+    if (aligned && (N % 4 == 0)) {
+        sgemm_fast_kernel<<<blocks, NUM_THREADS, 0, stream>>>(A, B, C, M, N, K);
+    } else {
+        sgemm_general_kernel<<<blocks, NUM_THREADS, 0, stream>>>(A, B, C, M, N, K);
+    }
+    CUDEEP_CHECK_LAST_KERNEL();
+}
+
+template <>
+void launch_matmul_kernel_fp32<double>(const double* A, const double* B, double* C,
+                                        int M, int N, int K, cudaStream_t stream) {
+    launch_matmul_kernel<double>(A, B, C, M, N, K, stream);
+}
+
 template <typename T>
 void launch_matmul_tiled_kernel(const T* A, const T* B, T* C,
                                  int M, int N, int K, int, cudaStream_t stream) {
@@ -736,6 +756,8 @@ void launch_matmul_tiled_kernel(const T* A, const T* B, T* C,
 
 template void launch_matmul_kernel<float>(const float*, const float*, float*, int, int, int, cudaStream_t);
 template void launch_matmul_kernel<double>(const double*, const double*, double*, int, int, int, cudaStream_t);
+template void launch_matmul_kernel_fp32<float>(const float*, const float*, float*, int, int, int, cudaStream_t);
+template void launch_matmul_kernel_fp32<double>(const double*, const double*, double*, int, int, int, cudaStream_t);
 template void launch_matmul_tiled_kernel<float>(const float*, const float*, float*, int, int, int, int, cudaStream_t);
 template void launch_matmul_tiled_kernel<double>(const double*, const double*, double*, int, int, int, int, cudaStream_t);
 

@@ -215,7 +215,7 @@ static std::vector<BenchResult> bench_gemm() {
         int iters  = (M <= 512) ? 200 : 100;
         double flops = 2.0 * M * N * K;
 
-        float cu_ms = timed_run([&]{ cudeep::kernels::launch_matmul_kernel<float>(A, B, C_cu, M, N, K, 0); }, warmup, iters);
+        float cu_ms = timed_run([&]{ cudeep::kernels::launch_matmul_kernel_fp32<float>(A, B, C_cu, M, N, K, 0); }, warmup, iters);
 
         float alpha = 1.0f, beta = 0.0f;
         float cb_ms = timed_run([&]{
@@ -770,16 +770,26 @@ static std::vector<BenchResult> bench_reductions() {
 // ---------------------------------------------------------------------------
 
 int main() {
-    cudaDeviceProp prop;
-    CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
+    int dev = 0;
+    char dev_name[256] = {0};
+    int sms = 0, clock_khz = 0, mem_clock_khz = 0, mem_bus_width = 0;
+    int cc_major = 0, cc_minor = 0;
+    size_t total_mem = 0;
 
-    int clock_khz = 0, mem_clock_khz = 0, mem_bus_width = 0;
-    cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, 0);
-    cudaDeviceGetAttribute(&mem_clock_khz, cudaDevAttrMemoryClockRate, 0);
-    cudaDeviceGetAttribute(&mem_bus_width, cudaDevAttrGlobalMemoryBusWidth, 0);
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, dev);
+    cudaDeviceGetAttribute(&mem_clock_khz, cudaDevAttrMemoryClockRate, dev);
+    cudaDeviceGetAttribute(&mem_bus_width, cudaDevAttrGlobalMemoryBusWidth, dev);
+    cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, dev);
+    cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor, dev);
+    {
+        cudaDeviceProp prop;
+        CHECK_CUDA(cudaGetDeviceProperties(&prop, dev));
+        snprintf(dev_name, sizeof(dev_name), "%s", prop.name);
+        total_mem = prop.totalGlobalMem;
+    }
 
-    float peak_fp32_gflops = (float)prop.multiProcessorCount * 128 * 2 *
-                             clock_khz / 1e6f;
+    float peak_fp32_gflops = (float)sms * 128 * 2 * clock_khz / 1e6f;
     float peak_bw_gbs = 2.0f * mem_clock_khz * 1e3f *
                         (mem_bus_width / 8.0f) / 1e9f;
 
@@ -788,10 +798,10 @@ int main() {
     printf("  %scuDeep vs cuBLAS + cuDNN  —  HEAD-TO-HEAD BENCHMARK%s\n", C_BOLD, C_RESET);
     printf("%s\n", std::string(104, '=').c_str());
     printf("  Device   : %s%s%s  (SM %d.%d, %d SMs @ %.0f MHz)\n",
-           C_CYAN, prop.name, C_RESET, prop.major, prop.minor,
-           prop.multiProcessorCount, clock_khz / 1e3f);
+           C_CYAN, dev_name, C_RESET, cc_major, cc_minor,
+           sms, clock_khz / 1e3f);
     printf("  VRAM     : %zu MB   |   Peak FP32: %.0f GFLOPS   |   Peak BW: %.0f GB/s\n",
-           prop.totalGlobalMem >> 20, peak_fp32_gflops, peak_bw_gbs);
+           total_mem >> 20, peak_fp32_gflops, peak_bw_gbs);
     printf("  cuBLAS   : cublasSgemm / cublasGemmEx\n");
     printf("  cuDNN    : %d.%d.%d\n", CUDNN_MAJOR, CUDNN_MINOR, CUDNN_PATCHLEVEL);
     printf("  Format   : %s>>> FASTER%s = cuDeep wins,  %s<<< SLOWER%s = ref wins,  %s=== TIED%s = within 3%%\n",
@@ -807,7 +817,7 @@ int main() {
     };
 
     Section sections[] = {
-        {"SGEMM (FP32)",              "cuBLAS",  bench_gemm},
+        {"SGEMM (FP32 CUDA Core, no TC)", "cuBLAS", bench_gemm},
         {"GEMM (TF32 Tensor Core)",   "cuBLAS TF32", bench_gemm_tf32},
         {"Conv2d Forward",            "cuDNN",   bench_conv2d},
         {"Activations",               "cuDNN",   bench_activations},

@@ -12,6 +12,12 @@ void launch_matmul_kernel(
     cudaStream_t stream = nullptr);
 
 template <typename T>
+void launch_matmul_kernel_fp32(
+    const T* A, const T* B, T* C,
+    int M, int N, int K,
+    cudaStream_t stream = nullptr);
+
+template <typename T>
 void launch_matmul_tiled_kernel(
     const T* A, const T* B, T* C,
     int M, int N, int K,

@@ -13,24 +13,11 @@ Ultra-high performance deep learning library implemented in low-level CUDA with 
 
 ## Benchmarks — cuDeep vs cuBLAS / cuDNN
 
-Head-to-head against NVIDIA's own libraries on **Jetson Orin** (SM 8.7, 8 SMs, CUDA 12.2, cuDNN 9.3).
+Honest head-to-head against NVIDIA's own libraries on **Jetson Orin** (SM 8.7, 8 SMs, CUDA 12.2, cuDNN 9.3). All comparisons use **matching precision modes** — no mixing TF32 against FP32.
 
-### SGEMM (FP32) vs cuBLAS — 8/8 wins
+### Where cuDeep wins
 
-| Size | cuDeep | cuBLAS | Speedup |
-|------|-------:|-------:|--------:|
-| 256x256x256 | 0.030 ms | 0.052 ms | **1.76x faster** |
-| 512x512x512 | 0.114 ms | 0.266 ms | **2.33x faster** |
-| 1024x1024x1024 | 0.812 ms | 1.830 ms | **2.25x faster** |
-| 2048x2048x2048 | 6.780 ms | 14.282 ms | **2.11x faster** |
-| 4096x4096x4096 | 53.581 ms | 113.560 ms | **2.12x faster** |
-| 128x4096x512 | 0.257 ms | 0.519 ms | **2.02x faster** |
-| 4096x128x512 | 0.270 ms | 0.521 ms | **1.93x faster** |
-| 1024x1024x4096 | 3.067 ms | 7.136 ms | **2.33x faster** |
-
-> cuDeep's tiled SGEMM with double-buffered software pipelining and `cp.async` delivers **~2x the throughput** of cuBLAS `cublasSgemm` across all tested sizes.
-
-### Activations vs cuDNN — 12/12 wins
+**Activations vs cuDNN — 12/12 wins**
 
 | Kernel | Size | cuDeep | cuDNN | Speedup |
 |--------|------|-------:|------:|--------:|
@@ -45,7 +32,7 @@ Head-to-head against NVIDIA's own libraries on **Jetson Orin** (SM 8.7, 8 SMs, C
 
 > Vectorized `float4` loads/stores with fused compute — consistently **8-16% faster** than cuDNN activations.
 
-### Reductions vs cuBLAS — 6/6 wins
+**Reductions vs cuBLAS — 6/6 wins**
 
 | Op | Size | cuDeep | cuBLAS | Speedup |
 |----|------|-------:|-------:|--------:|
@@ -58,29 +45,35 @@ Head-to-head against NVIDIA's own libraries on **Jetson Orin** (SM 8.7, 8 SMs, C
 
 > Warp-shuffle tree reductions with vectorized global loads — **up to 2.7x faster** than cuBLAS `sasum`/`isamax`.
 
-### Softmax vs cuDNN — 2 wins, 4 losses
+### Where cuDeep is competitive
 
-| Size | cuDeep | cuDNN | Result |
-|------|-------:|------:|--------|
-| 32x32768 | 0.287 ms | 0.362 ms | **1.26x faster** |
-| 256x1024 | 0.037 ms | 0.041 ms | **1.10x faster** |
-| 128x512 | 0.013 ms | 0.009 ms | 1.50x slower |
-| 1024x1024 | 0.174 ms | 0.146 ms | 1.19x slower |
+**SGEMM FP32 (CUDA Core, no Tensor Cores) vs cuBLAS — within 4-17%**
 
-> cuDeep wins on large inner dimensions; cuDNN has the edge on mid-range sizes.
+| Size | cuDeep | cuBLAS | Gap |
+|------|-------:|-------:|----:|
+| 512 | 0.822 ms | 0.794 ms | 1.04x slower |
+| 1024 | 6.152 ms | 5.244 ms | 1.17x slower |
+| 2048 | 49.44 ms | 44.79 ms | 1.10x slower |
+| 4096 | 401.4 ms | 384.8 ms | 1.04x slower |
 
-### Areas Under Active Optimization
+> Hand-written tiled SGEMM with double-buffered `cp.async` pipelining, reaching **86-96% of cuBLAS FP32** at large sizes. For small matrices (N < 512), cuBLAS's heuristic dispatch has a significant edge.
+
+**Softmax vs cuDNN — mixed (2 wins, 4 losses)**
+
+> cuDeep wins on large inner dimensions (32K+); cuDNN has the edge on mid-range sizes (128-1024).
+
+### Areas under active optimization
 
 | Category | vs | Status |
 |----------|----|--------|
-| TF32 Tensor Core GEMM | cuBLAS TF32 | ~50% of cuBLAS speed — pipeline depth & swizzling WIP |
-| Conv2d (im2col + GEMM) | cuDNN | 21-77% of cuDNN — limited by underlying GEMM; Winograd planned |
-| BatchNorm (fused) | cuDNN | 61-91% of cuDNN — fused Welford single-pass kernel |
+| TF32 Tensor Core GEMM | cuBLAS TF32 | 34-72% of cuBLAS TF32 — pipeline depth, swizzling, warp scheduling WIP |
+| Conv2d (im2col + GEMM) | cuDNN | 21-77% of cuDNN — bottlenecked by underlying GEMM; Winograd planned for 3x3 |
+| BatchNorm (fused Welford) | cuDNN | 61-91% of cuDNN |
 | Pooling | cuDNN | ~90% of cuDNN — vectorization planned |
 
-### Overall: 28 wins / 24 losses / 2 ties across 54 benchmarks
+### Methodology
 
-cuDeep **dominates on pure compute** (SGEMM, activations, reductions) and is **closing the gap** on algorithm-heavy ops (conv, batchnorm) where cuDNN leverages Winograd and multi-stage autotuning.
+All benchmarks use matching precision modes on both sides. The SGEMM section forces the FP32 CUDA Core path (no Tensor Cores), compared against `cublasSgemm` (also FP32). The TF32 section compares cuDeep's Tensor Core kernel against `cublasGemmEx` with `CUBLAS_COMPUTE_32F_FAST_TF32`. We don't inflate numbers by comparing different precisions.
 
 ## Requirements
 
