@@ -132,7 +132,7 @@ int main() {
     float peak_fp32_gflops = (float)sms * 128 * 2 * clock_khz / 1e6f;
 
     printf("\n%s\n", "========================================================================================================");
-    printf("  %scuDeep SGEMM — Honest Benchmark vs cuBLAS%s\n", C_BOLD, C_RESET);
+    printf("  %scuDeep SGEMM — Performance Benchmark vs cuBLAS%s\n", C_BOLD, C_RESET);
     printf("%s\n", "========================================================================================================");
     printf("  Device : %s%s%s  (%d SMs @ %.0f MHz)\n",
            C_CYAN, prop.name, C_RESET, sms, clock_khz / 1e3f);
@@ -149,7 +149,7 @@ int main() {
     // ---- Section 1: FP32 CUDA Core vs cuBLAS FP32 ----
     printf("\n%s\n", "--------------------------------------------------------------------------------------------------------");
     printf("  %sSECTION 1: FP32 CUDA Core%s  —  cuDeep (no TC) vs cuBLAS cublasSgemm (no TC)\n", C_BOLD, C_RESET);
-    printf("  Both use true FP32 precision (23-bit mantissa). Apples-to-apples.\n");
+    printf("  Both use FP32 CUDA Cores. No Tensor Cores.\n");
     printf("%s\n", "--------------------------------------------------------------------------------------------------------");
     printf("  %6s  %9s  %9s  %9s  %9s  %-18s\n",
            "Size", "cuDeep ms", "cuDeep GF", "cuBLAS ms", "cuBLAS GF", "VERDICT");
@@ -184,7 +184,7 @@ int main() {
 
         printf("\n%s\n", "--------------------------------------------------------------------------------------------------------");
         printf("  %sSECTION 2: TF32 Tensor Core%s  —  cuDeep TC vs cuBLAS TF32 (cublasGemmEx)\n", C_BOLD, C_RESET);
-        printf("  Both use TF32 precision (~10-bit mantissa). Apples-to-apples.\n");
+        printf("  Both use TF32 Tensor Cores (~10-bit mantissa).\n");
         printf("%s\n", "--------------------------------------------------------------------------------------------------------");
         printf("  %6s  %9s  %9s  %9s  %9s  %-18s\n",
                "Size", "cuDeep ms", "cuDeep GF", "cuBLAS ms", "cuBLAS GF", "VERDICT");
