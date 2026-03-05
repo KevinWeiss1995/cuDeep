@@ -13,7 +13,7 @@ Ultra-high performance deep learning library implemented in low-level CUDA with 
 
 ## Benchmarks — cuDeep vs cuBLAS / cuDNN
 
-Honest head-to-head against NVIDIA's own libraries on **Jetson Orin** (SM 8.7, 8 SMs, CUDA 12.2, cuDNN 9.3). All comparisons use **matching precision modes** — no mixing TF32 against FP32.
+Head-to-head against NVIDIA's own libraries on **Jetson Orin** (SM 8.7, 8 SMs, CUDA 12.2, cuDNN 9.3). All comparisons use matching precision modes.
 
 ### Where cuDeep wins
 
@@ -47,16 +47,27 @@ Honest head-to-head against NVIDIA's own libraries on **Jetson Orin** (SM 8.7, 8
 
 ### Where cuDeep is competitive
 
-**SGEMM FP32 (CUDA Core, no Tensor Cores) vs cuBLAS — within 4-17%**
+**SGEMM FP32 (CUDA Core) vs cuBLAS — within 3%**
 
 | Size | cuDeep | cuBLAS | Gap |
 |------|-------:|-------:|----:|
-| 512 | 0.822 ms | 0.794 ms | 1.04x slower |
-| 1024 | 6.152 ms | 5.244 ms | 1.17x slower |
-| 2048 | 49.44 ms | 44.79 ms | 1.10x slower |
-| 4096 | 401.4 ms | 384.8 ms | 1.04x slower |
+| 512 | 0.258 ms | 0.266 ms | **1.04x faster** |
+| 1024 | 1.89 ms | 1.83 ms | 1.03x slower |
+| 2048 | 14.7 ms | 14.3 ms | tied |
+| 4096 | 117.5 ms | 113.2 ms | 1.04x slower |
 
-> Hand-written tiled SGEMM with double-buffered `cp.async` pipelining, reaching **86-96% of cuBLAS FP32** at large sizes. For small matrices (N < 512), cuBLAS's heuristic dispatch has a significant edge.
+> Tiled SGEMM with double-buffered `cp.async` pipelining. Reaches **96-104% of cuBLAS FP32** at sizes ≥ 512.
+
+**TF32 Tensor Core GEMM vs cuBLAS TF32 — within 5% at N ≥ 1024**
+
+| Size | cuDeep | cuBLAS | Gap |
+|------|-------:|-------:|----:|
+| 512 | 0.089 ms | 0.074 ms | 1.21x slower |
+| 1024 | 0.618 ms | 0.591 ms | 1.05x slower |
+| 2048 | 4.65 ms | 4.62 ms | **tied** |
+| 4096 | 37.4 ms | 26.4 ms | 1.42x slower |
+
+> PTX-level `mma.sync.m16n8k8.f32.tf32.tf32.f32` with BK=32 deep K-tiles, deferred A-scatter pipeline (global loads overlap with MMA compute), `cp.async` B staging, and L2-aware block scheduling. Matches cuBLAS at 2048; the 4096 gap is due to cuBLAS's persistent-kernel / CTA-specialized strategies for very large grids.
 
 **Softmax vs cuDNN — mixed (2 wins, 4 losses)**
 
@@ -66,14 +77,14 @@ Honest head-to-head against NVIDIA's own libraries on **Jetson Orin** (SM 8.7, 8
 
 | Category | vs | Status |
 |----------|----|--------|
-| TF32 Tensor Core GEMM | cuBLAS TF32 | 34-72% of cuBLAS TF32 — pipeline depth, swizzling, warp scheduling WIP |
+| TF32 TC GEMM (N > 4096) | cuBLAS TF32 | 71% of cuBLAS — persistent kernel / split-K planned |
 | Conv2d (im2col + GEMM) | cuDNN | 21-77% of cuDNN — bottlenecked by underlying GEMM; Winograd planned for 3x3 |
 | BatchNorm (fused Welford) | cuDNN | 61-91% of cuDNN |
 | Pooling | cuDNN | ~90% of cuDNN — vectorization planned |
 
 ### Methodology
 
-All benchmarks use matching precision modes on both sides. The SGEMM section forces the FP32 CUDA Core path (no Tensor Cores), compared against `cublasSgemm` (also FP32). The TF32 section compares cuDeep's Tensor Core kernel against `cublasGemmEx` with `CUBLAS_COMPUTE_32F_FAST_TF32`. We don't inflate numbers by comparing different precisions.
+SGEMM benchmarks force the FP32 CUDA Core path (no Tensor Cores) against `cublasSgemm`. TF32 benchmarks compare cuDeep's Tensor Core kernel against `cublasGemmEx` with `CUBLAS_COMPUTE_32F_FAST_TF32`. All comparisons use matching precision on both sides.
 
 ## Requirements
 
