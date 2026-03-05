@@ -28,13 +28,17 @@ constexpr int TM = 8;
 constexpr int TN = 8;
 
 // ---- TC (Tensor Core) parameters ----
-constexpr int TC_WM = 32;                       // warp tile M
-constexpr int TC_WN = 64;                       // warp tile N
-constexpr int TC_WARPS_M = BM / TC_WM;          // 4
-constexpr int TC_WARPS_N = BN / TC_WN;          // 2
+constexpr int BK_TC = 32;                        // deeper K-tile for TC path
+constexpr int TC_WM = 32;                        // warp tile M
+constexpr int TC_WN = 64;                        // warp tile N
+constexpr int TC_WARPS_M = BM / TC_WM;           // 4
+constexpr int TC_WARPS_N = BN / TC_WN;           // 2
 constexpr int MMA_M = 16, MMA_N = 8, MMA_K = 8;
-constexpr int MMA_TILES_M = TC_WM / MMA_M;      // 2
-constexpr int MMA_TILES_N = TC_WN / MMA_N;      // 8
+constexpr int MMA_TILES_M = TC_WM / MMA_M;       // 2
+constexpr int MMA_TILES_N = TC_WN / MMA_N;       // 8
+
+constexpr size_t TC_SMEM_BYTES =
+    (2 * BK_TC * SMEM_A_STRIDE + 2 * BK_TC * SMEM_B_STRIDE) * sizeof(float);
 
 // ---- Tile loading params (common to all float kernels) ----
 // A: 128×16 = 2048 elems, 256 threads, 8 scalar loads/thread
@@ -77,14 +81,30 @@ void sgemm_tc_kernel(const float* __restrict__ A,
                      float* __restrict__ C,
                      int M, int N, int K) {
 
-    __shared__ float As[2][BK][SMEM_A_STRIDE];
-    __shared__ float Bs[2][BK][SMEM_B_STRIDE];
+    extern __shared__ float _smem[];
+    constexpr int As_plane = BK_TC * SMEM_A_STRIDE;
+    constexpr int Bs_plane = BK_TC * SMEM_B_STRIDE;
+    float (*As)[BK_TC][SMEM_A_STRIDE] =
+        reinterpret_cast<float (*)[BK_TC][SMEM_A_STRIDE]>(_smem);
+    float (*Bs)[BK_TC][SMEM_B_STRIDE] =
+        reinterpret_cast<float (*)[BK_TC][SMEM_B_STRIDE]>(_smem + 2 * As_plane);
 
-    const int bm = blockIdx.y * BM;
-    const int bn = blockIdx.x * BN;
+    // L2 cache tiling: remap blocks into super-tile groups where adjacent
+    // blocks share the same M-row band, maximizing A-tile L2 reuse.
+    int bm, bn;
+    {
+        constexpr int SW = 4;
+        const int tiles_n = gridDim.x;
+        const int tiles_m = gridDim.y;
+        const int linear = blockIdx.x + blockIdx.y * tiles_n;
+        const int sw = (tiles_n < SW) ? tiles_n : SW;
+        const int group = linear / (sw * tiles_m);
+        const int rem = linear % (sw * tiles_m);
+        bm = (rem / sw) * BM;
+        bn = (group * sw + rem % sw) * BN;
+    }
     const int tid = threadIdx.x;
 
-    // Warp / lane decomposition
     const int warp_id = tid / 32;
     const int lane = tid % 32;
     const int warp_m = warp_id / TC_WARPS_N;
@@ -92,7 +112,6 @@ void sgemm_tc_kernel(const float* __restrict__ A,
     const int gid = lane / 4;
     const int tg  = lane % 4;
 
-    // Accumulators
     float acc[MMA_TILES_M][MMA_TILES_N][4];
     #pragma unroll
     for (int mi = 0; mi < MMA_TILES_M; ++mi)
@@ -102,52 +121,64 @@ void sgemm_tc_kernel(const float* __restrict__ A,
             acc[mi][ni][2] = 0.f; acc[mi][ni][3] = 0.f;
         }
 
-    // A load mapping — vectorized float4, then scatter-transpose to As[k][m]
-    // 256 threads, each loads 2 float4's → 128 rows × 16 cols = 2048 floats
-    const int a_f4_row = tid / 4;        // 0..63
-    const int a_f4_col = (tid % 4) * 4;  // 0, 4, 8, 12
+    // A load mapping: 128 rows × 32 cols → 4 float4 per thread
+    const int a_f4_row = tid / 8;         // 0..31
+    const int a_f4_col = (tid % 8) * 4;   // 0, 4, 8, ..., 28
 
-    // B load mapping — 2 float4 per thread via cp.async
-    const int b_row0 = tid / 32;
+    // B load mapping: 32 rows × 128 cols → 4 cp.async per thread
+    const int b_row_base = tid / 32;       // 0..7
     const int b_col4 = tid % 32;
-    const int b_row1 = 8 + b_row0;
 
-    // ---- Tile loaders ----
-    // A: load float4 from row-major A, scatter-transpose into As[k][m]
-    #define LOAD_A(buf, bk_off) do {                                         \
-        {                                                                     \
-            const float* _src0 = &A[(bm + a_f4_row) * K + (bk_off) + a_f4_col]; \
-            float4 _v0 = *reinterpret_cast<const float4*>(_src0);           \
-            As[buf][a_f4_col    ][a_f4_row]      = _v0.x;                   \
-            As[buf][a_f4_col + 1][a_f4_row]      = _v0.y;                   \
-            As[buf][a_f4_col + 2][a_f4_row]      = _v0.z;                   \
-            As[buf][a_f4_col + 3][a_f4_row]      = _v0.w;                   \
-        }                                                                     \
-        {                                                                     \
-            const float* _src1 = &A[(bm + a_f4_row + 64) * K + (bk_off) + a_f4_col]; \
-            float4 _v1 = *reinterpret_cast<const float4*>(_src1);           \
-            As[buf][a_f4_col    ][a_f4_row + 64] = _v1.x;                   \
-            As[buf][a_f4_col + 1][a_f4_row + 64] = _v1.y;                   \
-            As[buf][a_f4_col + 2][a_f4_row + 64] = _v1.z;                   \
-            As[buf][a_f4_col + 3][a_f4_row + 64] = _v1.w;                   \
-        }                                                                     \
+    float4 _a_pf0, _a_pf1, _a_pf2, _a_pf3;
+
+    #define LOAD_A_ISSUE(bk_off) do {                                        \
+        _a_pf0 = *reinterpret_cast<const float4*>(                           \
+            &A[(bm + a_f4_row     ) * K + (bk_off) + a_f4_col]);           \
+        _a_pf1 = *reinterpret_cast<const float4*>(                           \
+            &A[(bm + a_f4_row + 32) * K + (bk_off) + a_f4_col]);           \
+        _a_pf2 = *reinterpret_cast<const float4*>(                           \
+            &A[(bm + a_f4_row + 64) * K + (bk_off) + a_f4_col]);           \
+        _a_pf3 = *reinterpret_cast<const float4*>(                           \
+            &A[(bm + a_f4_row + 96) * K + (bk_off) + a_f4_col]);           \
+    } while(0)
+
+    #define LOAD_A_STORE(buf) do {                                           \
+        As[buf][a_f4_col    ][a_f4_row     ] = _a_pf0.x;                   \
+        As[buf][a_f4_col + 1][a_f4_row     ] = _a_pf0.y;                   \
+        As[buf][a_f4_col + 2][a_f4_row     ] = _a_pf0.z;                   \
+        As[buf][a_f4_col + 3][a_f4_row     ] = _a_pf0.w;                   \
+        As[buf][a_f4_col    ][a_f4_row + 32] = _a_pf1.x;                   \
+        As[buf][a_f4_col + 1][a_f4_row + 32] = _a_pf1.y;                   \
+        As[buf][a_f4_col + 2][a_f4_row + 32] = _a_pf1.z;                   \
+        As[buf][a_f4_col + 3][a_f4_row + 32] = _a_pf1.w;                   \
+        As[buf][a_f4_col    ][a_f4_row + 64] = _a_pf2.x;                   \
+        As[buf][a_f4_col + 1][a_f4_row + 64] = _a_pf2.y;                   \
+        As[buf][a_f4_col + 2][a_f4_row + 64] = _a_pf2.z;                   \
+        As[buf][a_f4_col + 3][a_f4_row + 64] = _a_pf2.w;                   \
+        As[buf][a_f4_col    ][a_f4_row + 96] = _a_pf3.x;                   \
+        As[buf][a_f4_col + 1][a_f4_row + 96] = _a_pf3.y;                   \
+        As[buf][a_f4_col + 2][a_f4_row + 96] = _a_pf3.z;                   \
+        As[buf][a_f4_col + 3][a_f4_row + 96] = _a_pf3.w;                   \
     } while(0)
 
     #define LOAD_B(buf, bk_off) do {                                         \
         ptx::cp_async_cg_16(                                                  \
-            &Bs[buf][b_row0][b_col4 * 4],                                    \
-            &B[((bk_off) + b_row0) * N + bn + b_col4 * 4]);                 \
+            &Bs[buf][b_row_base     ][b_col4 * 4],                          \
+            &B[((bk_off) + b_row_base     ) * N + bn + b_col4 * 4]);       \
         ptx::cp_async_cg_16(                                                  \
-            &Bs[buf][b_row1][b_col4 * 4],                                    \
-            &B[((bk_off) + b_row1) * N + bn + b_col4 * 4]);                 \
+            &Bs[buf][b_row_base +  8][b_col4 * 4],                          \
+            &B[((bk_off) + b_row_base +  8) * N + bn + b_col4 * 4]);       \
+        ptx::cp_async_cg_16(                                                  \
+            &Bs[buf][b_row_base + 16][b_col4 * 4],                          \
+            &B[((bk_off) + b_row_base + 16) * N + bn + b_col4 * 4]);       \
+        ptx::cp_async_cg_16(                                                  \
+            &Bs[buf][b_row_base + 24][b_col4 * 4],                          \
+            &B[((bk_off) + b_row_base + 24) * N + bn + b_col4 * 4]);       \
     } while(0)
 
-    // ---- MMA compute macro ----
-    // B fragments hoisted outside the M-tile loop to halve shared memory reads.
-    // Per k-step: load 8 B tile pairs once, reuse across both M-tiles.
     #define TC_COMPUTE(buf) do {                                             \
         _Pragma("unroll")                                                     \
-        for (int _kk = 0; _kk < BK; _kk += MMA_K) {                        \
+        for (int _kk = 0; _kk < BK_TC; _kk += MMA_K) {                     \
             uint32_t _breg[MMA_TILES_N][2];                                  \
             _Pragma("unroll")                                                 \
             for (int _ni = 0; _ni < MMA_TILES_N; ++_ni) {                   \
@@ -182,34 +213,37 @@ void sgemm_tc_kernel(const float* __restrict__ A,
         }                                                                     \
     } while(0)
 
-    // ---- Main loop with double buffering ----
-    LOAD_A(0, 0);
+    // ---- Prologue: load first tile ----
+    LOAD_A_ISSUE(0);
     LOAD_B(0, 0);
     ptx::cp_async_commit();
+    LOAD_A_STORE(0);
     ptx::cp_async_wait_all();
     __syncthreads();
 
-    const int num_tiles = K / BK;
+    const int num_tiles = K / BK_TC;
     int buf = 0;
 
+    // ---- Main loop: A loads overlap with compute via scoreboard ----
     for (int t = 0; t < num_tiles - 1; ++t) {
-        LOAD_A(1 - buf, (t + 1) * BK);
-        LOAD_B(1 - buf, (t + 1) * BK);
+        LOAD_A_ISSUE((t + 1) * BK_TC);
+        LOAD_B(1 - buf, (t + 1) * BK_TC);
         ptx::cp_async_commit();
 
         TC_COMPUTE(buf);
 
+        LOAD_A_STORE(1 - buf);
         ptx::cp_async_wait_all();
         buf = 1 - buf;
         __syncthreads();
     }
     TC_COMPUTE(buf);
 
-    #undef LOAD_A
+    #undef LOAD_A_ISSUE
+    #undef LOAD_A_STORE
     #undef LOAD_B
     #undef TC_COMPUTE
 
-    // ---- Store C (float2 per output position) ----
     #pragma unroll
     for (int mi = 0; mi < MMA_TILES_M; ++mi) {
         int row0 = bm + warp_m * TC_WM + mi * MMA_M + gid;
@@ -239,11 +273,25 @@ void sgemm_tc_general_kernel(const float* __restrict__ A,
                               float* __restrict__ C,
                               int M, int N, int K) {
 
-    __shared__ float As[2][BK][SMEM_A_STRIDE];
-    __shared__ float Bs[2][BK][SMEM_B_STRIDE];
+    extern __shared__ float _smem_g[];
+    constexpr int As_plane = BK_TC * SMEM_A_STRIDE;
+    float (*As)[BK_TC][SMEM_A_STRIDE] =
+        reinterpret_cast<float (*)[BK_TC][SMEM_A_STRIDE]>(_smem_g);
+    float (*Bs)[BK_TC][SMEM_B_STRIDE] =
+        reinterpret_cast<float (*)[BK_TC][SMEM_B_STRIDE]>(_smem_g + 2 * As_plane);
 
-    const int bm = blockIdx.y * BM;
-    const int bn = blockIdx.x * BN;
+    int bm, bn;
+    {
+        constexpr int SW = 4;
+        const int tiles_n = gridDim.x;
+        const int tiles_m = gridDim.y;
+        const int linear = blockIdx.x + blockIdx.y * tiles_n;
+        const int sw = (tiles_n < SW) ? tiles_n : SW;
+        const int group = linear / (sw * tiles_m);
+        const int rem = linear % (sw * tiles_m);
+        bm = (rem / sw) * BM;
+        bn = (group * sw + rem % sw) * BN;
+    }
     const int tid = threadIdx.x;
 
     const int warp_id = tid / 32;
@@ -262,29 +310,33 @@ void sgemm_tc_general_kernel(const float* __restrict__ A,
             acc[mi][ni][2] = 0.f; acc[mi][ni][3] = 0.f;
         }
 
-    const int a_col  = tid % BK;
-    const int a_row0 = tid / BK;
-    const int b_row0 = tid / 32;
-    const int b_col4 = tid % 32;
-    const int b_row1 = 8 + b_row0;
+    const int a_col  = tid % BK_TC;
+    const int a_row0 = tid / BK_TC;
 
-    // Precompute whether this block is fully interior (skip bounds checks)
+    const int b_row_base = tid / 32;
+    const int b_col4 = tid % 32;
+
     const bool m_interior = (bm + BM <= M);
     const bool n_interior = (bn + BN <= N);
+    const bool b_row_aligned = (N & 3) == 0;
 
-    #define LOAD_A_G(buf, bk_off) do {                                       \
+    // Prefetch buffer for deferred A scatter (16 values per thread)
+    float _a_pf[16];
+
+    #define LOAD_A_G_ISSUE(bk_off) do {                                      \
         _Pragma("unroll")                                                     \
-        for (int _s = 0; _s < 8; ++_s) {                                    \
-            int _gr = bm + a_row0 + _s * 16;                                \
+        for (int _s = 0; _s < 16; ++_s) {                                   \
+            int _gr = bm + a_row0 + _s * 8;                                 \
             int _gc = (bk_off) + a_col;                                      \
-            As[buf][a_col][a_row0 + _s * 16] =                              \
-                (_gr < M && _gc < K) ? A[_gr * K + _gc] : 0.0f;            \
+            _a_pf[_s] = (_gr < M && _gc < K) ? A[_gr * K + _gc] : 0.0f;   \
         }                                                                     \
     } while(0)
 
-    // cp.async requires 16-byte aligned global address; when N%4 != 0
-    // the start of a row may be misaligned, so we need a runtime check.
-    const bool b_row_aligned = (N & 3) == 0;
+    #define LOAD_A_G_STORE(buf) do {                                         \
+        _Pragma("unroll")                                                     \
+        for (int _s = 0; _s < 16; ++_s)                                     \
+            As[buf][a_col][a_row0 + _s * 8] = _a_pf[_s];                   \
+    } while(0)
 
     #define LOAD_B_G(buf, bk_off) do {                                       \
         auto _lb = [&](int _br) {                                           \
@@ -305,13 +357,15 @@ void sgemm_tc_general_kernel(const float* __restrict__ A,
                     (_gr < K && _gc+3 < N) ? B[_gr*N+_gc+3] : 0.0f;        \
             }                                                                 \
         };                                                                    \
-        _lb(b_row0);                                                         \
-        _lb(b_row1);                                                         \
+        _lb(b_row_base);                                                     \
+        _lb(b_row_base + 8);                                                 \
+        _lb(b_row_base + 16);                                                \
+        _lb(b_row_base + 24);                                                \
     } while(0)
 
     #define TC_COMPUTE_G(buf) do {                                           \
         _Pragma("unroll")                                                     \
-        for (int _kk = 0; _kk < BK; _kk += MMA_K) {                        \
+        for (int _kk = 0; _kk < BK_TC; _kk += MMA_K) {                     \
             uint32_t _breg[MMA_TILES_N][2];                                  \
             _Pragma("unroll")                                                 \
             for (int _ni = 0; _ni < MMA_TILES_N; ++_ni) {                   \
@@ -346,31 +400,35 @@ void sgemm_tc_general_kernel(const float* __restrict__ A,
         }                                                                     \
     } while(0)
 
-    int num_tiles = (K + BK - 1) / BK;
+    int num_tiles = (K + BK_TC - 1) / BK_TC;
 
-    LOAD_A_G(0, 0);
+    LOAD_A_G_ISSUE(0);
     LOAD_B_G(0, 0);
     ptx::cp_async_commit();
+    LOAD_A_G_STORE(0);
     ptx::cp_async_wait_all();
     __syncthreads();
 
     int buf = 0;
     for (int t = 0; t < num_tiles - 1; ++t) {
-        LOAD_A_G(1 - buf, (t + 1) * BK);
-        LOAD_B_G(1 - buf, (t + 1) * BK);
+        LOAD_A_G_ISSUE((t + 1) * BK_TC);
+        LOAD_B_G(1 - buf, (t + 1) * BK_TC);
         ptx::cp_async_commit();
+
         TC_COMPUTE_G(buf);
+
+        LOAD_A_G_STORE(1 - buf);
         ptx::cp_async_wait_all();
         buf = 1 - buf;
         __syncthreads();
     }
     TC_COMPUTE_G(buf);
 
-    #undef LOAD_A_G
+    #undef LOAD_A_G_ISSUE
+    #undef LOAD_A_G_STORE
     #undef LOAD_B_G
     #undef TC_COMPUTE_G
 
-    // Store C with bounds checking — use float2 when both elements are valid
     #pragma unroll
     for (int mi = 0; mi < MMA_TILES_M; ++mi) {
         int row0 = bm + warp_m * TC_WM + mi * MMA_M + gid;
@@ -700,22 +758,36 @@ static bool has_tensor_cores() {
     return cached == 1;
 }
 
+static void configure_tc_smem() {
+    static bool done = false;
+    if (done) return;
+    cudaFuncSetAttribute(sgemm_tc_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)TC_SMEM_BYTES);
+    cudaFuncSetAttribute(sgemm_tc_general_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)TC_SMEM_BYTES);
+    done = true;
+}
+
 template <>
 void launch_matmul_kernel<float>(const float* A, const float* B, float* C,
                                   int M, int N, int K, cudaStream_t stream) {
     dim3 blocks(ceil_div(N, BN), ceil_div(M, BM));
-    bool aligned = (M % BM == 0) && (N % BN == 0) && (K % BK == 0);
 
     if (has_tensor_cores()) {
-        if (aligned) {
-            sgemm_tc_kernel<<<blocks, NUM_THREADS, 0, stream>>>(A, B, C, M, N, K);
+        configure_tc_smem();
+        bool tc_aligned = (M % BM == 0) && (N % BN == 0) && (K % BK_TC == 0);
+        if (tc_aligned) {
+            sgemm_tc_kernel<<<blocks, NUM_THREADS, TC_SMEM_BYTES, stream>>>(A, B, C, M, N, K);
         } else {
-            sgemm_tc_general_kernel<<<blocks, NUM_THREADS, 0, stream>>>(A, B, C, M, N, K);
+            sgemm_tc_general_kernel<<<blocks, NUM_THREADS, TC_SMEM_BYTES, stream>>>(A, B, C, M, N, K);
         }
-    } else if (aligned && (N % 4 == 0)) {
-        sgemm_fast_kernel<<<blocks, NUM_THREADS, 0, stream>>>(A, B, C, M, N, K);
     } else {
-        sgemm_general_kernel<<<blocks, NUM_THREADS, 0, stream>>>(A, B, C, M, N, K);
+        bool aligned = (M % BM == 0) && (N % BN == 0) && (K % BK == 0);
+        if (aligned && (N % 4 == 0)) {
+            sgemm_fast_kernel<<<blocks, NUM_THREADS, 0, stream>>>(A, B, C, M, N, K);
+        } else {
+            sgemm_general_kernel<<<blocks, NUM_THREADS, 0, stream>>>(A, B, C, M, N, K);
+        }
     }
     CUDEEP_CHECK_LAST_KERNEL();
 }
