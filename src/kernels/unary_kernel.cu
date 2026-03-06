@@ -204,9 +204,23 @@ void launch_gt_mask_kernel<double>(const double* input, float threshold, double*
 template <typename T>
 __global__ void sum_reduce_rows_kernel(const T* __restrict__ input, T* __restrict__ output,
                                         int64_t rows, int64_t cols) {
-    for (int64_t col = blockIdx.x * blockDim.x + threadIdx.x;
-         col < cols;
-         col += blockDim.x * gridDim.x) {
+    constexpr int VW = Vec4<T>::width;
+    int64_t tid    = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t stride = blockDim.x * gridDim.x;
+    int64_t vec_cols = cols / VW;
+
+    for (int64_t vc = tid; vc < vec_cols; vc += stride) {
+        typename Vec4<T>::type acc;
+        if constexpr (sizeof(T) == 4) { acc = make_float4(0,0,0,0); }
+        else                           { acc = make_double2(0,0); }
+        for (int64_t r = 0; r < rows; ++r) {
+            auto v = Vec4<T>::load(&input[r * cols + vc * VW]);
+            acc.x += v.x; acc.y += v.y;
+            if constexpr (sizeof(T) == 4) { acc.z += v.z; acc.w += v.w; }
+        }
+        Vec4<T>::store(&output[vc * VW], acc);
+    }
+    for (int64_t col = vec_cols * VW + tid; col < cols; col += stride) {
         T acc = T(0);
         for (int64_t r = 0; r < rows; ++r)
             acc += input[r * cols + col];

@@ -1,5 +1,34 @@
 #include "cudeep/kernels/loss.cuh"
+#include "cudeep/ptx_intrinsics.cuh"
 #include "cudeep/error.cuh"
+
+namespace {
+
+template <typename T>
+__device__ __forceinline__ T fast_exp_dispatch(T x) {
+    if constexpr (sizeof(T) == 4)
+        return cudeep::ptx::fast_exp_ptx(static_cast<float>(x));
+    else
+        return exp(x);
+}
+
+template <typename T>
+__device__ __forceinline__ T fast_log_dispatch(T x) {
+    if constexpr (sizeof(T) == 4)
+        return cudeep::ptx::fast_log_ptx(static_cast<float>(x));
+    else
+        return log(x);
+}
+
+template <typename T>
+__device__ __forceinline__ T fast_rcp_dispatch(T x) {
+    if constexpr (sizeof(T) == 4)
+        return cudeep::ptx::sfu_rcp(static_cast<float>(x));
+    else
+        return T(1) / x;
+}
+
+}  // anonymous namespace
 
 namespace cudeep {
 namespace kernels {
@@ -13,12 +42,28 @@ __global__ void mse_loss_kernel(const T* __restrict__ pred,
                                  const T* __restrict__ target,
                                  T* loss, int64_t n) {
     T acc = T(0);
-    for (int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
-         i < n;
-         i += blockDim.x * gridDim.x) {
+    constexpr int VW = Vec4<T>::width;
+    int64_t tid    = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t stride = blockDim.x * gridDim.x;
+    int64_t vec_n  = n / VW;
+
+    for (int64_t i = tid; i < vec_n; i += stride) {
+        auto vp = Vec4<T>::load(&pred[i * VW]);
+        auto vt = Vec4<T>::load(&target[i * VW]);
+        if constexpr (sizeof(T) == 4) {
+            float d0 = vp.x - vt.x, d1 = vp.y - vt.y;
+            float d2 = vp.z - vt.z, d3 = vp.w - vt.w;
+            acc += d0*d0 + d1*d1 + d2*d2 + d3*d3;
+        } else {
+            double d0 = vp.x - vt.x, d1 = vp.y - vt.y;
+            acc += d0*d0 + d1*d1;
+        }
+    }
+    for (int64_t i = vec_n * VW + tid; i < n; i += stride) {
         T diff = pred[i] - target[i];
         acc += diff * diff;
     }
+
     acc = block_reduce_sum(acc);
     if (threadIdx.x == 0)
         atomicAdd(loss, acc / static_cast<T>(n));
@@ -62,10 +107,10 @@ __global__ void softmax_kernel(const T* __restrict__ input,
     for (int i = threadIdx.x; i < dim; i += blockDim.x) {
         T val = in_row[i];
         if (val > thread_max) {
-            thread_sum = thread_sum * exp(thread_max - val) + T(1);
+            thread_sum = thread_sum * fast_exp_dispatch(thread_max - val) + T(1);
             thread_max = val;
         } else {
-            thread_sum += exp(val - thread_max);
+            thread_sum += fast_exp_dispatch(val - thread_max);
         }
     }
 
@@ -87,8 +132,8 @@ __global__ void softmax_kernel(const T* __restrict__ input,
             other_sum = shfl_down_double(thread_sum, offset);
         }
         T new_max = max(thread_max, other_max);
-        thread_sum = thread_sum * exp(thread_max - new_max) +
-                     other_sum * exp(other_max - new_max);
+        thread_sum = thread_sum * fast_exp_dispatch(thread_max - new_max) +
+                     other_sum * fast_exp_dispatch(other_max - new_max);
         thread_max = new_max;
     }
 
@@ -114,26 +159,39 @@ __global__ void softmax_kernel(const T* __restrict__ input,
                 other_sum = shfl_down_double(thread_sum, offset);
             }
             T new_max = max(thread_max, other_max);
-            thread_sum = thread_sum * exp(thread_max - new_max) +
-                         other_sum * exp(other_max - new_max);
+            thread_sum = thread_sum * fast_exp_dispatch(thread_max - new_max) +
+                         other_sum * fast_exp_dispatch(other_max - new_max);
             thread_max = new_max;
         }
     }
 
-    // Broadcast final max and inv_sum to all threads
     __shared__ T row_max_s, row_inv_sum_s;
     if (threadIdx.x == 0) {
         row_max_s = thread_max;
-        row_inv_sum_s = T(1) / thread_sum;
+        row_inv_sum_s = fast_rcp_dispatch(thread_sum);
     }
     __syncthreads();
 
     T row_max = row_max_s;
     T inv_sum = row_inv_sum_s;
 
-    // Pass 2: write normalized values
-    for (int i = threadIdx.x; i < dim; i += blockDim.x)
-        out_row[i] = exp(in_row[i] - row_max) * inv_sum;
+    constexpr int VW = Vec4<T>::width;
+    int vec_dim = dim / VW;
+    for (int i = threadIdx.x; i < vec_dim; i += blockDim.x) {
+        auto v = Vec4<T>::load(&in_row[i * VW]);
+        if constexpr (sizeof(T) == 4) {
+            v.x = fast_exp_dispatch(v.x - row_max) * inv_sum;
+            v.y = fast_exp_dispatch(v.y - row_max) * inv_sum;
+            v.z = fast_exp_dispatch(v.z - row_max) * inv_sum;
+            v.w = fast_exp_dispatch(v.w - row_max) * inv_sum;
+        } else {
+            v.x = fast_exp_dispatch(v.x - row_max) * inv_sum;
+            v.y = fast_exp_dispatch(v.y - row_max) * inv_sum;
+        }
+        Vec4<T>::store(&out_row[i * VW], v);
+    }
+    for (int i = vec_dim * VW + threadIdx.x; i < dim; i += blockDim.x)
+        out_row[i] = fast_exp_dispatch(in_row[i] - row_max) * inv_sum;
 }
 
 template <typename T>
@@ -144,38 +202,90 @@ void launch_softmax_kernel(const T* input, T* output, int batch, int dim, cudaSt
 }
 
 // ===========================================================================
-// Cross-Entropy Loss — parallelise over batch with block-level reduction
-// Use online softmax trick per row for numerical stability.
+// Fused Warp-Cooperative Cross-Entropy Loss
+//
+// One warp per sample. Online softmax (single pass over the class dimension
+// using warp shuffles to combine running max + sum_exp), then immediately
+// compute -log(softmax[target]). No intermediate softmax materialisation,
+// no shared memory for the class-dimension reduction.
+//
+// For batch > warps-per-block, multiple warps share a block and their
+// partial losses are block-reduced before atomicAdd.
 // ===========================================================================
+
+constexpr int CE_WARPS_PER_BLOCK = 8;
+constexpr int CE_THREADS = CE_WARPS_PER_BLOCK * WARP_SIZE;
+
+template <typename T>
+__device__ __forceinline__ void warp_online_softmax_reduce(T& my_max, T& my_sum) {
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        T other_max, other_sum;
+        if constexpr (sizeof(T) == 4) {
+            other_max = __shfl_down_sync(0xffffffff, my_max, offset);
+            other_sum = __shfl_down_sync(0xffffffff, my_sum, offset);
+        } else {
+            other_max = shfl_down_double(my_max, offset);
+            other_sum = shfl_down_double(my_sum, offset);
+        }
+        T new_max = max(my_max, other_max);
+        my_sum = my_sum * fast_exp_dispatch(my_max - new_max) +
+                 other_sum * fast_exp_dispatch(other_max - new_max);
+        my_max = new_max;
+    }
+}
 
 template <typename T>
 __global__ void cross_entropy_loss_kernel(
     const T* __restrict__ logits, const int* __restrict__ targets, T* loss,
     int batch, int num_classes
 ) {
-    T acc = T(0);
-    for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
-         idx < batch;
-         idx += blockDim.x * gridDim.x) {
-        const T* row = logits + idx * num_classes;
-        int target = targets[idx];
+    int warp_id_global = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    int lane = threadIdx.x & 31;
+    int local_warp = threadIdx.x >> 5;
 
-        T row_max = row[0];
-        for (int c = 1; c < num_classes; ++c)
-            row_max = max(row_max, row[c]);
+    __shared__ T s_loss[CE_WARPS_PER_BLOCK];
+    s_loss[local_warp] = T(0);
+    __syncthreads();
 
-        T sum_exp = T(0);
-        for (int c = 0; c < num_classes; ++c)
-            sum_exp += exp(row[c] - row_max);
+    T warp_loss = T(0);
 
-        T log_softmax = row[target] - row_max - log(sum_exp);
-        acc -= log_softmax;
+    for (int sample = warp_id_global; sample < batch;
+         sample += (gridDim.x * blockDim.x) / WARP_SIZE) {
+        const T* row = logits + sample * num_classes;
+        int target = targets[sample];
+
+        T my_max = T(-1e38);
+        T my_sum = T(0);
+
+        for (int c = lane; c < num_classes; c += WARP_SIZE) {
+            T val = row[c];
+            if (val > my_max) {
+                my_sum = my_sum * fast_exp_dispatch(my_max - val) + T(1);
+                my_max = val;
+            } else {
+                my_sum += fast_exp_dispatch(val - my_max);
+            }
+        }
+
+        warp_online_softmax_reduce(my_max, my_sum);
+
+        if (lane == 0) {
+            T log_softmax = row[target] - my_max - fast_log_dispatch(my_sum);
+            warp_loss -= log_softmax;
+        }
     }
 
-    acc = block_reduce_sum(acc);
+    if (lane == 0)
+        s_loss[local_warp] = warp_loss;
+    __syncthreads();
 
-    if (threadIdx.x == 0)
-        atomicAdd(loss, acc / static_cast<T>(batch));
+    if (threadIdx.x < CE_WARPS_PER_BLOCK) {
+        T val = s_loss[threadIdx.x];
+        val = warp_reduce_sum(static_cast<float>(val));
+        if (threadIdx.x == 0)
+            atomicAdd(loss, static_cast<T>(val) / static_cast<T>(batch));
+    }
 }
 
 template <typename T>
@@ -184,9 +294,10 @@ void launch_cross_entropy_loss_kernel(
     int batch, int num_classes, cudaStream_t stream
 ) {
     CUDEEP_CHECK_CUDA(cudaMemsetAsync(loss, 0, sizeof(T), stream));
-    int threads = DEFAULT_BLOCK_SIZE;
-    int blocks = min(ceil_div(batch, threads), 256);
-    cross_entropy_loss_kernel<<<blocks, threads, 0, stream>>>(
+    int total_warps = (batch + 0) ;  // one warp per sample ideal
+    int blocks = min(ceil_div(total_warps, CE_WARPS_PER_BLOCK), 256);
+    blocks = max(blocks, 1);
+    cross_entropy_loss_kernel<<<blocks, CE_THREADS, 0, stream>>>(
         logits, targets, loss, batch, num_classes);
     CUDEEP_CHECK_LAST_KERNEL();
 }

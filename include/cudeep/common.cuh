@@ -67,18 +67,45 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
     return val;
 }
 
+// IEEE 754: for non-negative floats, the unsigned integer representation
+// preserves ordering.  For general floats we flip negative encodings so
+// that the unsigned max/min maps to float max/min.
+__device__ __forceinline__ unsigned int float_to_ordered_uint(float v) {
+    unsigned int u = __float_as_uint(v);
+    unsigned int mask = -int(u >> 31) | 0x80000000u;
+    return u ^ mask;
+}
+__device__ __forceinline__ float ordered_uint_to_float(unsigned int u) {
+    unsigned int mask = ((u >> 31) - 1) | 0x80000000u;
+    return __uint_as_float(u ^ mask);
+}
+
 __device__ __forceinline__ float warp_reduce_max(float val) {
+#if __CUDA_ARCH__ >= 800
+    unsigned int u = float_to_ordered_uint(val);
+    unsigned int r;
+    asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(r) : "r"(u));
+    return ordered_uint_to_float(r);
+#else
     #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
         val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
     return val;
+#endif
 }
 
 __device__ __forceinline__ float warp_reduce_min(float val) {
+#if __CUDA_ARCH__ >= 800
+    unsigned int u = float_to_ordered_uint(val);
+    unsigned int r;
+    asm volatile("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(r) : "r"(u));
+    return ordered_uint_to_float(r);
+#else
     #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
         val = fminf(val, __shfl_down_sync(0xffffffff, val, offset));
     return val;
+#endif
 }
 
 __device__ __forceinline__ double shfl_down_double(double val, int offset) {
