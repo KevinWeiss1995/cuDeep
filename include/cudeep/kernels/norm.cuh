@@ -21,5 +21,12 @@ void launch_layernorm_forward_kernel(
     int batch_size, int normalized_size, float eps,
     cudaStream_t stream = nullptr);
 
+template <typename T>
+void launch_rmsnorm_forward_kernel(
+    const T* input, T* output,
+    const T* weight,
+    int batch_size, int normalized_size, float eps,
+    cudaStream_t stream = nullptr);
+
 }  // namespace kernels
 }  // namespace cudeep

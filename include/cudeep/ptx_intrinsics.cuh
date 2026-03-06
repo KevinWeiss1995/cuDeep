@@ -565,7 +565,75 @@ __device__ __forceinline__ float fast_softplus_ptx(float x) {
 }
 
 // ===========================================================================
-// 10. TF32 Conversion Helpers
+// 10. Hopper-Specific Instructions (SM 9.0+)
+//
+// TMA (Tensor Memory Accelerator): single-thread descriptor-based loads
+// that handle addressing, boundary checks, and multi-dimensional tiling
+// entirely in hardware.
+//
+// WGMMA (Warpgroup MMA): warpgroup-level (128 threads) MMA that operates
+// on larger tiles than mma.sync, with native overlap of TMA loads.
+// ===========================================================================
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define CUDEEP_HAS_HOPPER 1
+#else
+#define CUDEEP_HAS_HOPPER 0
+#endif
+
+// TMA fence and prefetch instructions
+__device__ __forceinline__ void tma_fence_acquire() {
+#if CUDEEP_HAS_HOPPER
+    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+#endif
+}
+
+__device__ __forceinline__ void tma_store_arrive() {
+#if CUDEEP_HAS_HOPPER
+    asm volatile("cp.async.bulk.commit_group;\n" ::: "memory");
+#endif
+}
+
+__device__ __forceinline__ void tma_store_wait() {
+#if CUDEEP_HAS_HOPPER
+    asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
+#endif
+}
+
+// Cluster-level barrier (SM 9.0+)
+__device__ __forceinline__ void cluster_arrive() {
+#if CUDEEP_HAS_HOPPER
+    asm volatile("barrier.cluster.arrive;\n" ::: "memory");
+#endif
+}
+
+__device__ __forceinline__ void cluster_wait() {
+#if CUDEEP_HAS_HOPPER
+    asm volatile("barrier.cluster.wait;\n" ::: "memory");
+#endif
+}
+
+// WGMMA fence
+__device__ __forceinline__ void wgmma_fence_aligned() {
+#if CUDEEP_HAS_HOPPER
+    asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+#endif
+}
+
+__device__ __forceinline__ void wgmma_commit_group() {
+#if CUDEEP_HAS_HOPPER
+    asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+#endif
+}
+
+__device__ __forceinline__ void wgmma_wait_group() {
+#if CUDEEP_HAS_HOPPER
+    asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
+#endif
+}
+
+// ===========================================================================
+// 11. TF32 Conversion Helpers
 // ===========================================================================
 
 // Round FP32 to TF32 (truncate mantissa from 23 to 10 bits)
